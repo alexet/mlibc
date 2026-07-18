@@ -1,5 +1,6 @@
 #include "mlibc/tcb.hpp"
 #include <abi-bits/errno.h>
+#include <abi-bits/vm-flags.h>
 #include <bits/ensure.h>
 #include <etos/syscall.hpp>
 #include <mlibc/all-sysdeps.hpp>
@@ -131,8 +132,54 @@ int Sysdeps<Close>::operator()(int) {
 int Sysdeps<Open>::operator()(const char *, int, unsigned int, int *) {
 	STUB();
 }
-int Sysdeps<VmMap>::operator()(void *, size_t, int, int, int, off_t, void **) {
-	STUB();
+// Only the anonymous case is implemented — etos has no real files to back a
+// mapping with ("no file implementation, everything is a pipe/tty", see
+// Open/Seek above). This exists because mlibc's own internal allocator
+// (options/internal/generic/allocator.cpp's MemoryAllocator, used e.g. for
+// large/growth allocations distinct from the process's regular malloc) goes
+// through VmMap directly rather than AnonAllocate for every anonymous
+// mapping it makes, regardless of size — so leaving this a hard stub aborts
+// the process the first time that allocator needs to grow, which in
+// practice happens under large enough workloads (observed: Mesa's GLSL
+// compiler).
+//
+// etos's CALL_PROC_MAP_ANON has no PROT_NONE / lazily-committed-region
+// concept (freshly mapped pages are always immediately backed and
+// read-write) and no MAP_FIXED support for re-mapping part of an existing
+// region with different permissions. MemoryAllocator::allocate's two-call
+// pattern — (1) reserve pg_size+2*pageSize as PROT_NONE, (2) MAP_FIXED a
+// PROT_READ|PROT_WRITE sub-range of it, excluding one guard page — is
+// approximated rather than reproduced exactly: call (1) just performs a
+// real, fully-accessible mapping of the requested size (there is no way to
+// make it PROT_NONE), and call (2) (recognized by `addr` being non-null and
+// `flags` containing MAP_FIXED) is a no-op that reports success, since the
+// range it asks to "commit" already is. The practical effect is a working
+// allocator with one fewer enforced guard page than on a real POSIX target
+// — a debugging aid lost, not a correctness gap: etos user pages are always
+// RWX-mapped anyway (kernel/src/memory/allocator.rs never sets NO_EXECUTE
+// on them), so there was no real W^X/PROT_NONE guarantee being approximated
+// away to begin with.
+int Sysdeps<VmMap>::operator()(void *addr, size_t length, int prot, int flags, int fd, off_t offset, void **window) {
+	(void)prot;
+	(void)offset;
+	if (fd != -1 || !(flags & MAP_ANONYMOUS))
+		return ENOTSUP; // no file-backed mmap on etos
+
+	if (addr != nullptr && (flags & MAP_FIXED)) {
+		// "Commit" call over an already fully-mapped region from a prior
+		// anonymous call (see comment above): nothing to do.
+		*window = addr;
+		return 0;
+	}
+
+	uint64_t pages = (length + 0xFFF) >> 12;
+	auto r = etos::syscall(
+	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MAP_ANON, 0), pages, /*addr hint*/ 0
+	);
+	if (r.err != 0 || r.a0 == UINT64_MAX)
+		return ENOMEM;
+	*window = reinterpret_cast<void *>(r.a0);
+	return 0;
 }
 int Sysdeps<VmUnmap>::operator()(void *, size_t) {
 	STUB();
