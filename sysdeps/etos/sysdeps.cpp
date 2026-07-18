@@ -43,16 +43,16 @@ int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *re
 	auto p = reinterpret_cast<uint64_t>(buf);
 	size_t written = 0;
 	while (written < size) {
+		// Poll first: a fresh write can report TARGET_NOT_READY while the
+		// pipe (or the user-space Tty behind it) has no space yet.
+		etos::syscall(etos::dispatch(etos::STDOUT, etos::CALL_PIPE_WRITE_POLL, 0));
 		auto r = etos::syscall(
 		    etos::dispatch(etos::STDOUT, etos::CALL_PIPE_WRITE, 2), p + written, size - written
 		);
+		if (r.err == etos::ERR_TARGET_NOT_READY)
+			continue;
 		if (r.err != 0)
 			return EIO;
-		if (r.a0 == 0) {
-			// Pipe full: block until there is space, then retry.
-			etos::syscall(etos::dispatch(etos::STDOUT, etos::CALL_PIPE_WRITE_POLL, 0));
-			continue;
-		}
 		written += r.a0;
 	}
 	*ret = static_cast<ssize_t>(written);
@@ -62,13 +62,22 @@ int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *re
 int Sysdeps<Read>::operator()(int fd, void *buf, unsigned long size, long *ret) {
 	// Every fd maps to the STDIN read pipe.
 	(void)fd;
-	auto r = etos::syscall(
-	    etos::dispatch(etos::STDIN, etos::CALL_PIPE_READ, 1), reinterpret_cast<uint64_t>(buf), size
-	);
-	if (r.err != 0)
-		return EIO;
-	*ret = static_cast<long>(r.a1);
-	return 0;
+	while (true) {
+		etos::syscall(etos::dispatch(etos::STDIN, etos::CALL_PIPE_READ_POLL, 0));
+		auto r = etos::syscall(
+		    etos::dispatch(etos::STDIN, etos::CALL_PIPE_READ, 1),
+		    reinterpret_cast<uint64_t>(buf),
+		    size
+		);
+		if (r.err == etos::ERR_TARGET_NOT_READY)
+			continue;
+		if (r.err != 0)
+			return EIO;
+		if (r.a1 == 0 && size > 0)
+			continue; // spurious wakeup with no data: poll again
+		*ret = static_cast<long>(r.a1);
+		return 0;
+	}
 }
 
 int Sysdeps<TcbSet>::operator()(void *pointer) {

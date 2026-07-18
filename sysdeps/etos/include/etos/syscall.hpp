@@ -23,6 +23,7 @@ inline constexpr uint16_t CALL_EXIT_PROCESS = 11;
 inline constexpr uint16_t CALL_SET_FS_BASE = 12;
 
 // Object call indices.
+inline constexpr uint16_t CALL_PIPE_READ_POLL = 2;  // ReadPipe, encoding 0
 inline constexpr uint16_t CALL_PIPE_READ = 3;       // ReadPipe, encoding 1
 inline constexpr uint16_t CALL_PIPE_WRITE = 4;      // WritePipe, encoding 2
 inline constexpr uint16_t CALL_PIPE_WRITE_POLL = 5; // WritePipe, encoding 0
@@ -32,6 +33,10 @@ inline constexpr uint16_t CALL_PROC_UNMAP = 3;      // Proc, encoding 0
 inline constexpr uint64_t dispatch(uint32_t slot, uint16_t call_index, uint8_t encoding) {
 	return (uint64_t(slot) << 32) | (uint64_t(call_index) << 16) | (uint64_t(encoding) << 10);
 }
+
+// Error codes (rax on return; 0 = success).
+inline constexpr uint64_t ERR_TARGET_NOT_READY = 1;
+inline constexpr uint64_t ERR_TARGET_CLOSED = 2;
 
 struct Result {
 	uint64_t err; // 0 = success, otherwise an etos error code
