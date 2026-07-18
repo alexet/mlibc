@@ -123,7 +123,7 @@ if not no_headers
 	)
 endif
 
-if fs.is_dir(host_machine.cpu_family())
+if fs.is_dir(host_machine.cpu_family()) and get_variable('sysdep_supports_ifunc', true)
 	subdir(host_machine.cpu_family())
 endif
 

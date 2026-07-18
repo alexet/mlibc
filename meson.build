@@ -290,6 +290,8 @@ elif host_machine.system() == 'zinnia'
 	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', true)
 	internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', true)
 	subdir('sysdeps/zinnia')
+elif host_machine.system() == 'etos'
+	subdir('sysdeps/etos')
 # ANCHOR: demo-sysdeps
 elif host_machine.system() == 'demo'
 	subdir('sysdeps/demo')
