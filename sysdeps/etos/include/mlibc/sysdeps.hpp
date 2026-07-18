@@ -21,7 +21,10 @@ struct EtosSysdepTags :
 	Open,
 	VmMap,
 	VmUnmap,
-	ClockGet
+	ClockGet,
+	Clone,
+	PrepareStack,
+	ThreadExit
 {};
 
 template<typename Tag>

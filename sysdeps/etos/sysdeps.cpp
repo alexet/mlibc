@@ -127,12 +127,7 @@ void Sysdeps<Exit>::operator()(int status) {
 int Sysdeps<Close>::operator()(int) {
 	STUB();
 }
-int Sysdeps<FutexWake>::operator()(int *, bool) {
-	STUB();
-}
-int Sysdeps<FutexWait>::operator()(int *, int, timespec const *) {
-	STUB();
-}
+// FutexWake/FutexWait are implemented in generic/futex.cpp.
 int Sysdeps<Open>::operator()(const char *, int, unsigned int, int *) {
 	STUB();
 }

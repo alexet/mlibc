@@ -13,7 +13,11 @@ rtld_include_dirs += include_directories('include')
 
 libc_sources += files(
 	'generic/entry.cpp',
+	'generic/futex.cpp',
+	'generic/thread.cpp',
 	'sysdeps.cpp',
+	'crt-x86_64/thread-entry.S',
+	'crt-x86_64/watchdog-entry.S',
 )
 libc_include_dirs += include_directories('include')
 
