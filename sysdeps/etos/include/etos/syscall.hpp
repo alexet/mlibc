@@ -11,11 +11,16 @@
 namespace etos {
 
 inline constexpr uint32_t GLOBAL = 0xFFFF'FFFF;
+// Sentinel for "let the kernel pick a free slot", passed as the target_od
+// argument to calls that return a new object (e.g. Clock::map). Same bit
+// pattern as GLOBAL, but a distinct name for that argument position.
+inline constexpr uint32_t NO_SLOT = 0xFFFF'FFFF;
 
 // Well-known object slots vended by the kernel at process start.
 inline constexpr uint32_t STDIN = 0;
 inline constexpr uint32_t STDOUT = 1;
 inline constexpr uint32_t SELF_PROC = 2;
+inline constexpr uint32_t CLOCK = 4;
 
 // Global call indices.
 inline constexpr uint16_t CALL_RPC_CLOSE = 3;    // encoding 4; a0 = source_proc, a1 = od
@@ -35,7 +40,9 @@ inline constexpr uint16_t CALL_PIPE_WRITE_POLL = 5;   // WritePipe, encoding 0
 inline constexpr uint16_t CALL_PROC_CREATE_THREAD = 1; // Proc, encoding 0; a0 = ip, a1 = sp
 inline constexpr uint16_t CALL_PROC_MAP_ANON = 2;     // Proc, encoding 0
 inline constexpr uint16_t CALL_PROC_UNMAP = 3;        // Proc, encoding 0
+inline constexpr uint16_t CALL_PROC_MAP_MEMORY = 8;   // Proc, encoding 0; a0 = mem_od, a1 = addr (0 = kernel picks)
 inline constexpr uint16_t CALL_THREAD_WAKE = 8;       // Thread, encoding 0
+inline constexpr uint16_t CALL_CLOCK_MAP = 1;         // Clock, encoding 13; a0 = target_od
 
 inline constexpr uint64_t dispatch(uint32_t slot, uint16_t call_index, uint8_t encoding) {
 	return (uint64_t(slot) << 32) | (uint64_t(call_index) << 16) | (uint64_t(encoding) << 10);

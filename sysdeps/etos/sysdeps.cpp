@@ -137,8 +137,6 @@ int Sysdeps<VmMap>::operator()(void *, size_t, int, int, int, off_t, void **) {
 int Sysdeps<VmUnmap>::operator()(void *, size_t) {
 	STUB();
 }
-int Sysdeps<ClockGet>::operator()(int, time_t *, long *) {
-	STUB();
-}
+// ClockGet is implemented in generic/clock.cpp.
 
 } // namespace mlibc
