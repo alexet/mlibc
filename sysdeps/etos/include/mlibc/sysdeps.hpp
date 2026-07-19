@@ -19,6 +19,7 @@ struct EtosSysdepTags :
 	FutexWait,
 	Read,
 	Open,
+	Stat,
 	VmMap,
 	VmUnmap,
 	ClockGet,

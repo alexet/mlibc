@@ -1,10 +1,15 @@
 #include "mlibc/tcb.hpp"
 #include <abi-bits/errno.h>
+#include <abi-bits/fcntl.h>
+#include <abi-bits/seek-whence.h>
 #include <abi-bits/vm-flags.h>
 #include <bits/ensure.h>
 #include <etos/syscall.hpp>
 #include <mlibc/all-sysdeps.hpp>
+#include <mlibc/fsfd_target.hpp>
+#include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define STUB()                                                                                     \
 	({                                                                                             \
@@ -13,6 +18,127 @@
 	})
 
 namespace mlibc {
+
+// ── filesystem: fd table + path resolution ──────────────────────────────────────
+//
+// An etos object-descriptor slot is already fd-shaped (a small per-process
+// integer naming a kernel-tracked resource, closed by a dedicated syscall —
+// see `kernel/src/process.rs`'s slot-reusing `Vec<Slot>`), so `Open` hands the
+// freshly-opened `File`'s object slot back directly as the POSIX fd; no
+// separate fd-allocation layer. The only extra state needed is the read/write
+// offset, since etos's `File` RPCs are offset-explicit (`read_at`/`write_at`),
+// not stream-positioned like POSIX `read`/`write`. fd 0/1/2 are never real
+// files (they're the stdin/stdout pipes and the self-Proc capability) so they
+// never appear in this table.
+namespace {
+
+struct SpinLock {
+	void lock() {
+		while (__atomic_test_and_set(&flag, __ATOMIC_ACQUIRE)) {
+		}
+	}
+	void unlock() { __atomic_clear(&flag, __ATOMIC_RELEASE); }
+	char flag = 0;
+};
+
+constexpr size_t MAX_OPEN_FILES = 32;
+
+struct OffsetEntry {
+	bool used = false;
+	uint32_t fd = 0;
+	uint64_t offset = 0;
+};
+
+SpinLock fsLock;
+uint32_t rootFolderSlot = etos::NO_SLOT; // lazily opened, guarded by fsLock
+OffsetEntry offsetTable[MAX_OPEN_FILES];
+
+// Close an object slot (etos's global RPC-close call, see thread.cpp for the
+// same pattern used to tear down thread objects).
+void closeSlot(uint32_t slot) {
+	etos::syscall(etos::dispatch(etos::GLOBAL, etos::CALL_RPC_CLOSE, 4), etos::SELF_PROC, slot);
+}
+
+OffsetEntry *findEntryLocked(int fd) {
+	for (auto &e : offsetTable) {
+		if (e.used && e.fd == static_cast<uint32_t>(fd))
+			return &e;
+	}
+	return nullptr;
+}
+
+// Open the process's FS-slot FileSystem's root Folder once and cache its
+// slot. Fails if the process wasn't `run`-spawned with a FileSystem
+// capability at the well-known `etos::FS` slot.
+bool ensureRootLocked() {
+	if (rootFolderSlot != etos::NO_SLOT)
+		return true;
+	auto r = etos::object_call_retrying(
+	    etos::dispatch(etos::FS, etos::CALL_FS_ROOT, 14), 0, 0, etos::NO_SLOT
+	);
+	if (r.err != 0)
+		return false;
+	rootFolderSlot = static_cast<uint32_t>(r.a2);
+	return true;
+}
+
+// Resolve `pathname` (relative to the FS root — leading `/` is stripped;
+// etos `Folder` names reject `/`, `.`, `..` outright, so there is no `..`
+// traversal to handle) to a freshly-opened `File` object slot. Intermediate
+// directory slots are closed as the walk descends; only the final File slot
+// is left open. Returns `UINT32_MAX` and sets `*err` on failure.
+uint32_t resolvePathLocked(const char *pathname, int *err) {
+	if (!ensureRootLocked()) {
+		*err = ENOENT;
+		return UINT32_MAX;
+	}
+	while (*pathname == '/')
+		pathname++;
+	if (*pathname == '\0') {
+		*err = ENOENT;
+		return UINT32_MAX;
+	}
+
+	uint32_t dir = rootFolderSlot;
+	bool dirIsRoot = true;
+
+	while (true) {
+		const char *slash = strchr(pathname, '/');
+		size_t len = slash ? static_cast<size_t>(slash - pathname) : strlen(pathname);
+		bool last = (slash == nullptr) || slash[1] == '\0';
+		uint16_t callIndex =
+		    last ? etos::CALL_FOLDER_OPEN_FILE : etos::CALL_FOLDER_OPEN_FOLDER;
+
+		auto r = etos::object_call_retrying(
+		    etos::dispatch(dir, callIndex, 14),
+		    reinterpret_cast<uint64_t>(pathname),
+		    len,
+		    etos::NO_SLOT,
+		    last ? etos::FS_OPEN_READ : 0
+		);
+
+		if (!dirIsRoot)
+			closeSlot(dir);
+
+		if (r.err != 0) {
+			*err = EIO;
+			return UINT32_MAX;
+		}
+		if (r.a0 != 0) {
+			*err = (r.a0 == etos::FS_ERR_READ_ONLY) ? EROFS : ENOENT;
+			return UINT32_MAX;
+		}
+
+		if (last)
+			return static_cast<uint32_t>(r.a2);
+
+		dir = static_cast<uint32_t>(r.a2);
+		dirIsRoot = false;
+		pathname = slash + 1;
+	}
+}
+
+} // namespace
 
 void Sysdeps<LibcPanic>::operator()() {
 	sysdep<LibcLog>("!!! mlibc panic !!!");
@@ -39,8 +165,14 @@ int Sysdeps<Isatty>::operator()(int fd) {
 }
 
 int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *ret) {
-	// There is no stderr object: every fd maps to the STDOUT write pipe.
-	(void)fd;
+	// There is no stderr object: fd 1 maps to the STDOUT write pipe. Any other
+	// fd is looked up in the filesystem offset table (see resolvePathLocked).
+	if (fd != etos::STDOUT) {
+		fsLock.lock();
+		bool isOpenFile = findEntryLocked(fd) != nullptr;
+		fsLock.unlock();
+		return isOpenFile ? EROFS : EBADF; // initfs is read-only
+	}
 	auto p = reinterpret_cast<uint64_t>(buf);
 	size_t written = 0;
 	while (written < size) {
@@ -61,8 +193,36 @@ int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *re
 }
 
 int Sysdeps<Read>::operator()(int fd, void *buf, unsigned long size, long *ret) {
-	// Every fd maps to the STDIN read pipe.
-	(void)fd;
+	// fd 0 maps to the STDIN read pipe. Any other fd is a file opened via
+	// Sysdeps<Open>, read positionally at its tracked offset.
+	if (fd != etos::STDIN) {
+		fsLock.lock();
+		OffsetEntry *entry = findEntryLocked(fd);
+		if (!entry) {
+			fsLock.unlock();
+			return EBADF;
+		}
+		uint64_t offset = entry->offset;
+		fsLock.unlock();
+
+		auto r = etos::object_call_retrying(
+		    etos::dispatch(static_cast<uint32_t>(fd), etos::CALL_FILE_READ_AT, 1),
+		    reinterpret_cast<uint64_t>(buf),
+		    size,
+		    offset
+		);
+		if (r.err != 0)
+			return EIO;
+
+		fsLock.lock();
+		entry = findEntryLocked(fd);
+		if (entry)
+			entry->offset += r.a1;
+		fsLock.unlock();
+
+		*ret = static_cast<long>(r.a1);
+		return 0;
+	}
 	while (true) {
 		etos::syscall(etos::dispatch(etos::STDIN, etos::CALL_PIPE_READ_POLL, 0));
 		auto r = etos::syscall(
@@ -114,8 +274,52 @@ int Sysdeps<AnonFree>::operator()(void *pointer, unsigned long size) {
 	return 0;
 }
 
-int Sysdeps<Seek>::operator()(int, off_t, int, off_t *) {
-	return ESPIPE; // no file implementation, everything is a pipe/tty
+int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offset) {
+	fsLock.lock();
+	OffsetEntry *entry = findEntryLocked(fd);
+	if (!entry) {
+		fsLock.unlock();
+		return (fd == etos::STDIN || fd == etos::STDOUT) ? ESPIPE : EBADF;
+	}
+
+	uint64_t base;
+	switch (whence) {
+	case SEEK_SET:
+		base = 0;
+		break;
+	case SEEK_CUR:
+		base = entry->offset;
+		break;
+	case SEEK_END: {
+		fsLock.unlock();
+		auto r = etos::object_call_retrying(
+		    etos::dispatch(static_cast<uint32_t>(fd), etos::CALL_FILE_SIZE, 0)
+		);
+		if (r.err != 0 || r.a0 != 0)
+			return EIO;
+		fsLock.lock();
+		entry = findEntryLocked(fd);
+		if (!entry) {
+			fsLock.unlock();
+			return EBADF;
+		}
+		base = r.a1;
+		break;
+	}
+	default:
+		fsLock.unlock();
+		return EINVAL;
+	}
+
+	int64_t result = static_cast<int64_t>(base) + offset;
+	if (result < 0) {
+		fsLock.unlock();
+		return EINVAL;
+	}
+	entry->offset = static_cast<uint64_t>(result);
+	*new_offset = static_cast<off_t>(entry->offset);
+	fsLock.unlock();
+	return 0;
 }
 
 void Sysdeps<Exit>::operator()(int status) {
@@ -125,12 +329,110 @@ void Sysdeps<Exit>::operator()(int status) {
 	__builtin_unreachable();
 }
 
-int Sysdeps<Close>::operator()(int) {
-	STUB();
+int Sysdeps<Close>::operator()(int fd) {
+	// stdin/stdout/self-proc are not individually closeable through this call
+	// (matches Isatty's blanket tty treatment above).
+	if (fd == etos::STDIN || fd == etos::STDOUT || fd == static_cast<int>(etos::SELF_PROC))
+		return 0;
+
+	fsLock.lock();
+	OffsetEntry *entry = findEntryLocked(fd);
+	if (!entry) {
+		fsLock.unlock();
+		return EBADF;
+	}
+	entry->used = false;
+	fsLock.unlock();
+
+	closeSlot(static_cast<uint32_t>(fd));
+	return 0;
 }
 // FutexWake/FutexWait are implemented in generic/futex.cpp.
-int Sysdeps<Open>::operator()(const char *, int, unsigned int, int *) {
-	STUB();
+
+// Only O_RDONLY against the read-only initfs FileSystem (well-known slot
+// `etos::FS`, handed to `run`-spawned processes by init's `cmd_run`) is
+// supported — there is no writable filesystem wired up for user processes
+// yet. The returned fd *is* the freshly opened File's object slot (see the
+// "filesystem: fd table + path resolution" section above).
+int Sysdeps<Open>::operator()(const char *pathname, int flags, mode_t mode, int *fd) {
+	(void)mode;
+	if ((flags & O_ACCMODE) != O_RDONLY || (flags & O_CREAT))
+		return EROFS;
+
+	fsLock.lock();
+	int err = 0;
+	uint32_t slot = resolvePathLocked(pathname, &err);
+	if (slot == UINT32_MAX) {
+		fsLock.unlock();
+		return err;
+	}
+
+	OffsetEntry *entry = nullptr;
+	for (auto &e : offsetTable) {
+		if (!e.used) {
+			entry = &e;
+			break;
+		}
+	}
+	if (!entry) {
+		fsLock.unlock();
+		closeSlot(slot);
+		return EMFILE;
+	}
+	entry->used = true;
+	entry->fd = slot;
+	entry->offset = 0;
+	fsLock.unlock();
+
+	*fd = static_cast<int>(slot);
+	return 0;
+}
+
+// Practically required for buffered stdio (fstat-based block-size probing)
+// even though it isn't in mlibc's hard-mandatory sysdep list.
+int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int flags, struct stat *statbuf) {
+	(void)flags;
+	uint32_t slot;
+	bool opened = false;
+
+	if (fsfdt == fsfd_target::fd) {
+		slot = static_cast<uint32_t>(fd);
+	} else if (fsfdt == fsfd_target::path) {
+		fsLock.lock();
+		int err = 0;
+		slot = resolvePathLocked(path, &err);
+		fsLock.unlock();
+		if (slot == UINT32_MAX)
+			return err;
+		opened = true;
+	} else {
+		return ENOSYS;
+	}
+
+	// Wire `FileStat` layout (see utility/user_api/src/fs.rs): u64 size, u32
+	// is_dir, u32 padding.
+	uint8_t buf[16];
+	auto r = etos::object_call_retrying(
+	    etos::dispatch(slot, etos::CALL_FILE_STAT, 1), reinterpret_cast<uint64_t>(buf), sizeof(buf)
+	);
+
+	int result = 0;
+	if (r.err != 0 || r.a2 != 0) {
+		result = EIO;
+	} else {
+		uint64_t size;
+		uint32_t isDir;
+		memcpy(&size, buf, sizeof(size));
+		memcpy(&isDir, buf + sizeof(size), sizeof(isDir));
+		memset(statbuf, 0, sizeof(*statbuf));
+		statbuf->st_size = static_cast<off_t>(size);
+		statbuf->st_mode = (isDir ? S_IFDIR : S_IFREG) | 0444;
+		statbuf->st_nlink = 1;
+	}
+
+	if (opened)
+		closeSlot(slot);
+	return result;
 }
 // Only the anonymous case is implemented — etos has no real files to back a
 // mapping with ("no file implementation, everything is a pipe/tty", see
