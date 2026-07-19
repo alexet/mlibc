@@ -7,6 +7,8 @@ sysdep_supported_options = {
 sysdep_supports_ifunc = false
 
 rtld_sources += files(
+	'generic/futex.cpp',
+	'crt-x86_64/watchdog-entry.S',
 	'sysdeps.cpp',
 )
 rtld_include_dirs += include_directories('include')

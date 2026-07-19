@@ -8,6 +8,15 @@
 
 .section .text
 .global __etos_futex_watchdog_start
+// Hidden, not just global: default visibility makes lld emit a GLOB_DAT
+// relocation for futex.cpp's address-of reference to this symbol (even
+// though it's defined in the same object), since a default-visibility
+// symbol is preemptible in a shared object. ld.so's own relocateSelf()
+// bootstraps itself before any symbol table is usable and can only apply
+// symbol-less RELATIVE relocations -- it __builtin_trap()s on anything
+// else (see options/rtld/generic/main.cpp's relocateSelf), which is what
+// hit this before .hidden was added here.
+.hidden __etos_futex_watchdog_start
 __etos_futex_watchdog_start:
 	mov %rsp, %rdi
 	call __etos_futex_watchdog_entry

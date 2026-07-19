@@ -215,7 +215,15 @@ internal_conf.set_quoted('MLIBC_SYSTEM_NAME', host_machine.system())
 internal_conf.set_quoted('MLIBC_DEFAULT_LIBRARY_PATHS', '\\n'.join(default_library_paths))
 internal_conf.set('MLIBC_NUM_DEFAULT_LIBRARY_PATHS', default_library_paths.length())
 internal_conf.set10('MLIBC_MAP_DSO_SEGMENTS', false)
-internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', false)
+# etos has no reserved-safe low-memory convention for options/rtld/generic/
+# linker.cpp's hardcoded `libraryBase = 0x41000000` bump allocator (used when
+# this is false) to land in -- unlike a real mmap(PROT_NONE)-capable target,
+# there's no guarantee that fixed address is actually usable, and on etos it
+# isn't. Routing DSO base selection through the VmMap sysdep instead (kernel
+# picks a real, safe address, same as every other anonymous allocation) costs
+# nothing extra here since MLIBC_MAP_DSO_SEGMENTS is already false (etos has
+# no file-backed mmap, so segments are loaded via seek+read either way).
+internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', host_machine.system() == 'etos')
 internal_conf.set10('MLIBC_MAP_FILE_WINDOWS', false)
 internal_conf.set10('MLIBC_DEBUG_ALLOCATOR', get_option('debug_allocator'))
 

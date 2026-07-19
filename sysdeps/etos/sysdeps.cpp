@@ -103,8 +103,14 @@ uint32_t resolvePathLocked(const char *pathname, int *err) {
 	bool dirIsRoot = true;
 
 	while (true) {
-		const char *slash = strchr(pathname, '/');
-		size_t len = slash ? static_cast<size_t>(slash - pathname) : strlen(pathname);
+		// Hand-rolled instead of strchr/strlen: this file is linked into
+		// ld.so too (rtld_sources in sysdeps/etos/meson.build), which has no
+		// libc string implementation available to it.
+		const char *slash = pathname;
+		while (*slash != '\0' && *slash != '/')
+			slash++;
+		size_t len = static_cast<size_t>(slash - pathname);
+		slash = (*slash == '/') ? slash : nullptr;
 		bool last = (slash == nullptr) || slash[1] == '\0';
 		uint16_t callIndex =
 		    last ? etos::CALL_FOLDER_OPEN_FILE : etos::CALL_FOLDER_OPEN_FOLDER;
@@ -485,6 +491,15 @@ int Sysdeps<VmMap>::operator()(void *addr, size_t length, int prot, int flags, i
 }
 int Sysdeps<VmUnmap>::operator()(void *, size_t) {
 	STUB();
+}
+// A pure userspace no-op: etos user pages are always unconditionally
+// PRESENT|WRITABLE|USER_ACCESSIBLE (kernel/src/memory/allocator.rs never sets
+// NO_EXECUTE), and there is no kernel-side protect syscall to call — there's
+// nothing to enforce or relax. This exists only to satisfy ld.so's
+// sysdep_or_panic<VmProtect> call when it "tightens" a DSO segment's
+// protection after loading it read-write (options/rtld/generic/linker.cpp).
+int Sysdeps<VmProtect>::operator()(void *, size_t, int) {
+	return 0;
 }
 // ClockGet is implemented in generic/clock.cpp.
 
