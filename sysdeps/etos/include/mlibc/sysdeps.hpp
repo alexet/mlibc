@@ -26,7 +26,12 @@ struct EtosSysdepTags :
 	ClockGet,
 	Clone,
 	PrepareStack,
-	ThreadExit
+	ThreadExit,
+	GetPid,
+	GetUid,
+	GetEuid,
+	GetGid,
+	GetEgid
 {};
 
 template<typename Tag>

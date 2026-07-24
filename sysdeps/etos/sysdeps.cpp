@@ -503,4 +503,28 @@ int Sysdeps<VmProtect>::operator()(void *, size_t, int) {
 }
 // ClockGet is implemented in generic/clock.cpp.
 
+// etos has no UNIX-style user/group accounts or process-id numbering yet --
+// every process is just a capability-holding object, not a numbered entry in
+// a process table. These are needed because some library code (e.g. Mesa's
+// llvmpipe/LLVM stack, once linked in) calls geteuid()/getpid() unconditionally
+// on general init paths, not because anything here relies on real values.
+// Returning a fixed pid and uid/gid 0 ("root") is the correct stand-in until
+// etos grows real multi-user semantics, not a workaround for a missing
+// syscall.
+pid_t Sysdeps<GetPid>::operator()() {
+	return 1;
+}
+uid_t Sysdeps<GetUid>::operator()() {
+	return 0;
+}
+uid_t Sysdeps<GetEuid>::operator()() {
+	return 0;
+}
+gid_t Sysdeps<GetGid>::operator()() {
+	return 0;
+}
+gid_t Sysdeps<GetEgid>::operator()() {
+	return 0;
+}
+
 } // namespace mlibc

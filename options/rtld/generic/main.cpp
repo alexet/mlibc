@@ -1017,7 +1017,17 @@ int __dlapi_reverse(const void *ptr, __dlapi_symbol *info) {
 			start_symbols = hash_table->symbolOffset;
 			num_symbols = last_sym;
 		} else {
-			__ensure(!"unexpected hash style!");
+			// HashStyle::none: no DT_HASH/DT_GNU_HASH entry in this object's
+			// dynamic section. On etos, a fully static-PIE executable (no
+			// imported dynamic symbols, e.g. loaded directly by the etos ELF
+			// loader without ld.so) legitimately has no symbol hash table to
+			// walk here -- this isn't malformed input, just nothing to
+			// search by-name for. Callers of dladdr()-style lookups (e.g.
+			// LLVM's symbolization support, pulled in once llvmpipe links
+			// LLVM) fall back to the address-range scan below regardless, so
+			// skip this object's by-name search rather than treating it as
+			// fatal.
+			num_symbols = 0;
 		}
 
 		for(size_t i = start_symbols; i < num_symbols; i++) {
