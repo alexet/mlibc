@@ -626,9 +626,15 @@ int fd_file::parse_modestring(const char *mode) {
 } // namespace mlibc
 
 namespace {
-	mlibc::fd_file stdin_file{0};
-	mlibc::fd_file stdout_file{1};
-	mlibc::fd_file stderr_file{2, nullptr, true};
+	// Backing storage for stdin/stdout/stderr. These are deliberately *not* plain
+	// global fd_file objects: mlibc::initStdioStreams() placement-constructs them
+	// explicitly, before any .init_array constructor runs, and nothing ever calls
+	// their destructor, so stdio survives the entire lifetime of the process
+	// (including writes from static destructors that run during the normal C++
+	// global-destructor sequence at exit()).
+	frg::manual_box<mlibc::fd_file> stdin_box;
+	frg::manual_box<mlibc::fd_file> stdout_box;
+	frg::manual_box<mlibc::fd_file> stderr_box;
 
 	struct stdio_guard {
 		stdio_guard() { }
@@ -644,9 +650,22 @@ namespace {
 	} global_stdio_guard;
 } // namespace
 
-FILE *stderr = &stderr_file;
-FILE *stdin = &stdin_file;
-FILE *stdout = &stdout_file;
+FILE *stderr = nullptr;
+FILE *stdin = nullptr;
+FILE *stdout = nullptr;
+
+namespace mlibc {
+
+void initStdioStreams() {
+	stdin_box.initialize(0);
+	stdout_box.initialize(1);
+	stderr_box.initialize(2, nullptr, true);
+	stdin = stdin_box.get();
+	stdout = stdout_box.get();
+	stderr = stderr_box.get();
+}
+
+} // namespace mlibc
 
 int fileno_unlocked(FILE *file_base) {
 	auto file = static_cast<mlibc::fd_file *>(file_base);

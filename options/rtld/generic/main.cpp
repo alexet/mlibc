@@ -17,6 +17,10 @@
 #include <internal-config.h>
 #include <abi-bits/auxv.h>
 
+#if MLIBC_STATIC_BUILD
+#include <mlibc/file-io.hpp>
+#endif
+
 #include "elf.hpp"
 #include "linker.hpp"
 
@@ -207,6 +211,8 @@ extern "C" void relocateSelf68k(elf_dyn *dynamic, uintptr_t ldso_base) {
 #endif
 
 extern "C" void *lazyRelocate(SharedObject *object, unsigned int rel_index) {
+	mlibc::infoLogger() << "Lazy relocation" << frg::endlog;
+
 	__ensure(object->lazyExplicitAddend);
 	auto reloc = (elf_rela *)(object->baseAddress + object->lazyRelocTableOffset
 			+ rel_index * sizeof(elf_rela));
@@ -677,6 +683,14 @@ extern "C" void *interpreterMain(uintptr_t *entry_stack) {
 	globalDebugInterface.brk = &dl_debug_state;
 	globalDebugInterface.state = 0;
 	dl_debug_state();
+
+#if MLIBC_STATIC_BUILD
+	// stdin/stdout/stderr must be usable before any global constructor runs (ours or
+	// the application's) and must outlive every global destructor, so they're set up
+	// explicitly here rather than via the normal .init_array/atexit machinery run by
+	// initObjects() below. See mlibc::initStdioStreams()'s doc comment.
+	mlibc::initStdioStreams();
+#endif
 
 	linker.initObjects(initialRepository.get());
 

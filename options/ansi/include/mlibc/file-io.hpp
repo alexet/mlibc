@@ -147,6 +147,12 @@ void file_dispose_cb(abstract_file *base) {
 	frg::destruct(getAllocator(), static_cast<T *>(base));
 }
 
+// Constructs stdin/stdout/stderr in-place and points the FILE * globals at them.
+// Must run before any .init_array constructors (mlibc's or the application's), and
+// deliberately never has a matching teardown call, so that stdio stays usable from
+// destructors that run during the normal C++ global-destructor sequence.
+void initStdioStreams();
+
 } // namespace mlibc
 
 #endif // MLIBC_FILE_IO_HPP
