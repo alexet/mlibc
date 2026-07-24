@@ -34,10 +34,11 @@ const etos::ClockPage *ensure_clock_page() {
 		auto map_res =
 		    etos::syscall(etos::dispatch(etos::CLOCK, etos::CALL_CLOCK_MAP, 13), etos::NO_SLOT);
 		__ensure(map_res.err == 0);
+		// perms = READ | WRITE (bits 0 and 1) — see etos::MemPerm.
 		auto mem_res = etos::syscall(
-		    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MAP_MEMORY, 0), map_res.a0, 0
+		    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MAP_MEMORY, 0), map_res.a0, 0, 0b011
 		);
-		__ensure(mem_res.a0 != UINT64_MAX);
+		__ensure(mem_res.err == 0);
 		g_page = reinterpret_cast<const etos::ClockPage *>(mem_res.a0);
 		__atomic_store_n(&g_state, kReady, __ATOMIC_RELEASE);
 	} else {

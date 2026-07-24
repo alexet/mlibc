@@ -489,12 +489,13 @@ int Sysdeps<VmMap>::operator()(void *addr, size_t length, int prot, int flags, i
 	*window = reinterpret_cast<void *>(r.a0);
 	return 0;
 }
-// Only unmaps whole regions previously returned by Sysdeps<VmMap> (or
-// AnonAllocate) at the exact same address+length — mlibc's own call sites
-// (frigg's slab-pool huge-object free, file_window, the debug allocator)
-// never sub-range or merge, so no partial-unmap/splitting support is needed
-// here. Process::UNMAP (kernel/src/syscalls/objects.rs) is exact-match-only
-// and now reports an error rather than silently no-opping on a mismatch.
+// Process::UNMAP forward-processes: it always reports success in `err`
+// (rax) and instead carries (pages_done, status) in (a0, a1) — `pages_done`
+// pages starting at `addr` were actually unmapped, and `status` is 0 only if
+// every requested page was. mlibc's own call sites (frigg's slab-pool
+// huge-object free, file_window, the debug allocator) always unmap exactly
+// what they mapped, so any `status != 0` here means the range wasn't (fully)
+// mapped to begin with — a real error, not a partial success to tolerate.
 int Sysdeps<VmUnmap>::operator()(void *pointer, size_t length) {
 	auto addr = reinterpret_cast<uintptr_t>(pointer);
 	if (!pointer || (addr & 0xFFF) != 0)
@@ -502,14 +503,13 @@ int Sysdeps<VmUnmap>::operator()(void *pointer, size_t length) {
 
 	uint64_t pages = (length + 0xFFF) >> 12;
 	auto r = etos::syscall(etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_UNMAP, 0), addr, pages);
-	if (r.err != 0)
+	if (r.err != 0 || r.a1 != 0)
 		return EINVAL;
 	return 0;
 }
-// A pure userspace no-op: etos user pages are always unconditionally
-// PRESENT|WRITABLE|USER_ACCESSIBLE (kernel/src/memory/allocator.rs never sets
-// NO_EXECUTE), and there is no kernel-side protect syscall to call — there's
-// nothing to enforce or relax. This exists only to satisfy ld.so's
+// A pure userspace no-op. Process::MPROTECT (kernel/src/syscalls/objects.rs)
+// exists now, but nothing here calls it yet — wiring PROT_* through to it is
+// left as follow-up work. This exists only to satisfy ld.so's
 // sysdep_or_panic<VmProtect> call when it "tightens" a DSO segment's
 // protection after loading it read-write (options/rtld/generic/linker.cpp).
 int Sysdeps<VmProtect>::operator()(void *, size_t, int) {
