@@ -489,8 +489,22 @@ int Sysdeps<VmMap>::operator()(void *addr, size_t length, int prot, int flags, i
 	*window = reinterpret_cast<void *>(r.a0);
 	return 0;
 }
-int Sysdeps<VmUnmap>::operator()(void *, size_t) {
-	STUB();
+// Only unmaps whole regions previously returned by Sysdeps<VmMap> (or
+// AnonAllocate) at the exact same address+length — mlibc's own call sites
+// (frigg's slab-pool huge-object free, file_window, the debug allocator)
+// never sub-range or merge, so no partial-unmap/splitting support is needed
+// here. Process::UNMAP (kernel/src/syscalls/objects.rs) is exact-match-only
+// and now reports an error rather than silently no-opping on a mismatch.
+int Sysdeps<VmUnmap>::operator()(void *pointer, size_t length) {
+	auto addr = reinterpret_cast<uintptr_t>(pointer);
+	if (!pointer || (addr & 0xFFF) != 0)
+		return EINVAL;
+
+	uint64_t pages = (length + 0xFFF) >> 12;
+	auto r = etos::syscall(etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_UNMAP, 0), addr, pages);
+	if (r.err != 0)
+		return EINVAL;
+	return 0;
 }
 // A pure userspace no-op: etos user pages are always unconditionally
 // PRESENT|WRITABLE|USER_ACCESSIBLE (kernel/src/memory/allocator.rs never sets
