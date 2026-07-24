@@ -41,11 +41,18 @@ inline constexpr uint16_t CALL_PIPE_READ = 3;         // ReadPipe, encoding 1
 inline constexpr uint16_t CALL_PIPE_WRITE = 4;        // WritePipe, encoding 2
 inline constexpr uint16_t CALL_PIPE_WRITE_POLL = 5;   // WritePipe, encoding 0
 inline constexpr uint16_t CALL_PROC_CREATE_THREAD = 1; // Proc, encoding 0; a0 = ip, a1 = sp
-inline constexpr uint16_t CALL_PROC_MAP_ANON = 2;     // Proc, encoding 0
-inline constexpr uint16_t CALL_PROC_UNMAP = 3;        // Proc, encoding 0
-inline constexpr uint16_t CALL_PROC_MAP_MEMORY = 8;   // Proc, encoding 0; a0 = mem_od, a1 = addr (0 = kernel picks)
+inline constexpr uint16_t CALL_PROC_MAP_ANON = 2;     // Proc, encoding 0; a0 = page_count, a1 = addr, a2 = MemPerm
+inline constexpr uint16_t CALL_PROC_UNMAP = 3;        // Proc, encoding 0; returns (pages_done, status) in (a0, a1)
+inline constexpr uint16_t CALL_PROC_MAP_MEMORY = 8;   // Proc, encoding 0; a0 = mem_od, a1 = addr (0 = kernel picks), a2 = MemPerm
+inline constexpr uint16_t CALL_PROC_MPROTECT = 11;    // Proc, encoding 0; a0 = addr, a1 = page_count, a2 = MemPerm; returns (pages_done, status) in (a0, a1)
 inline constexpr uint16_t CALL_THREAD_WAKE = 8;       // Thread, encoding 0
 inline constexpr uint16_t CALL_CLOCK_MAP = 1;         // Clock, encoding 13; a0 = target_od
+
+// MemPerm bitmask (see etos_user_api::objects::MemPerm) — used as the
+// perms/prot argument to CALL_PROC_MAP_ANON/CALL_PROC_MAP_MEMORY/CALL_PROC_MPROTECT.
+inline constexpr uint64_t MEM_PERM_READ = 1 << 0;
+inline constexpr uint64_t MEM_PERM_WRITE = 1 << 1;
+inline constexpr uint64_t MEM_PERM_EXECUTE = 1 << 2;
 
 // FileSystem/Folder/File call indices (see utility/user_api/src/fs.rs, the
 // canonical client — this is a hand-rolled C++ counterpart of the same wire
@@ -123,7 +130,10 @@ inline Result object_call_retrying(
 // Map `pages` fresh anonymous zero-filled pages into this process (used for
 // thread/watchdog stacks). Returns nullptr on failure.
 inline void *map_anon_pages(uint64_t pages) {
-	auto r = syscall(dispatch(SELF_PROC, CALL_PROC_MAP_ANON, 0), pages, /*addr hint*/ 0);
+	auto r = syscall(
+	    dispatch(SELF_PROC, CALL_PROC_MAP_ANON, 0), pages, /*addr hint*/ 0,
+	    MEM_PERM_READ | MEM_PERM_WRITE
+	);
 	if (r.err != 0 || r.a0 == UINT64_MAX)
 		return nullptr;
 	return reinterpret_cast<void *>(r.a0);
