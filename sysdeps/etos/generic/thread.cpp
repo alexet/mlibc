@@ -9,6 +9,7 @@
 #include <abi-bits/errno.h>
 #include <atomic>
 #include <bits/ensure.h>
+#include <etos-idl/proc.hpp>
 #include <etos/syscall.hpp>
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/tcb.hpp>
@@ -83,21 +84,21 @@ int Sysdeps<PrepareStack>::operator()(
 
 int Sysdeps<Clone>::operator()(void *tcb, pid_t *pid_out, void *stack) {
 	(void)tcb;
-	auto r = etos::syscall(
-	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_CREATE_THREAD, 0),
-	    reinterpret_cast<uint64_t>(&__mlibc_start_thread),
-	    reinterpret_cast<uint64_t>(stack)
+	Process self(etos::SELF_PROC);
+	Thread thread(etos::NO_SLOT);
+	auto err = self.create_thread(
+	    reinterpret_cast<uint64_t>(&__mlibc_start_thread), reinterpret_cast<uint64_t>(stack),
+	    /*start_paused*/ false, &thread
 	);
-	if (r.err != 0)
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+	if (!err.is_ok())
 		return EAGAIN;
 
 	// The Thread capability itself isn't needed afterwards: mlibc's own
 	// thread_join/thread_exit are implemented entirely via FutexWait/FutexWake
 	// on tcb->didExit (options/internal/generic/threads.cpp), not via etos's
-	// native Thread::JOIN/WAKE, so close the slot immediately to avoid leaking
-	// one per pthread_create.
-	auto od = static_cast<uint32_t>(r.a0);
-	etos::syscall(etos::dispatch(etos::GLOBAL, etos::CALL_RPC_CLOSE, 4), etos::SELF_PROC, od);
+	// native Thread::JOIN/WAKE — `thread` closes it on scope exit, right here,
+	// to avoid leaking one per pthread_create.
 
 	*pid_out = next_tid_.fetch_add(1, std::memory_order_relaxed);
 	return 0;

@@ -13,6 +13,7 @@
 
 #include <abi-bits/errno.h>
 #include <bits/ensure.h>
+#include <etos-idl/proc.hpp>
 #include <etos/syscall.hpp>
 #include <mlibc/all-sysdeps.hpp>
 #include <stddef.h>
@@ -63,10 +64,11 @@ int alloc_waiter_locked() {
 }
 
 void wake_and_close(uint32_t thread_od) {
-	etos::syscall(etos::dispatch(thread_od, etos::CALL_THREAD_WAKE, 0));
-	etos::syscall(
-	    etos::dispatch(etos::GLOBAL, etos::CALL_RPC_CLOSE, 4), etos::SELF_PROC, thread_od
-	);
+	// `Thread(thread_od)` owns the slot here (unlike the borrowed-slot
+	// pattern used elsewhere in this file) — this function's whole job is
+	// "wake it, then close it", so letting the temporary's destructor close
+	// it is exactly what's wanted; no `.release()`.
+	Thread(thread_od).wake();
 }
 
 struct WatchdogCtx {
@@ -107,9 +109,9 @@ extern "C" [[noreturn]] void __etos_futex_watchdog_entry(void *slot) {
 		table_lock_.unlock();
 	}
 
-	etos::syscall(
-	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_UNMAP, 0), stack_base, stack_pages
-	);
+	Process self(etos::SELF_PROC);
+	self.unmap(stack_base, stack_pages);
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
 	etos::syscall(etos::dispatch(etos::GLOBAL, etos::CALL_EXIT_THREAD, 0));
 	__builtin_trap();
 }
@@ -164,11 +166,18 @@ int Sysdeps<FutexWait>::operator()(int *pointer, int expected, timespec const *t
 			uint64_t sp = (reinterpret_cast<uint64_t>(ctx) - 16) & ~0xFULL;
 			*reinterpret_cast<WatchdogCtx **>(sp) = ctx;
 
-			etos::syscall(
-			    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_CREATE_THREAD, 0),
-			    reinterpret_cast<uint64_t>(&__etos_futex_watchdog_start),
-			    sp
+			Process procSelf(etos::SELF_PROC);
+			Thread watchdogThread(etos::NO_SLOT);
+			procSelf.create_thread(
+			    reinterpret_cast<uint64_t>(&__etos_futex_watchdog_start), sp,
+			    /*start_paused*/ false, &watchdogThread
 			);
+			procSelf.release(); // SELF_PROC is borrowed, persistent — never close it
+			// watchdogThread closes on scope exit: this call is fire-and-forget
+			// (no result checked, degrades to an untimed wait on failure — see
+			// the comment below), and mlibc's own thread_join/thread_exit don't
+			// use etos's native Thread::JOIN/WAKE (see Sysdeps<Clone>'s matching
+			// comment in generic/thread.cpp), so nothing needs to keep it open.
 		}
 		// If the stack allocation failed, fall through without a watchdog:
 		// the wait degrades to an untimed wait rather than spuriously

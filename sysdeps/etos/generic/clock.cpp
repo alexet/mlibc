@@ -4,6 +4,8 @@
 
 #include <abi-bits/errno.h>
 #include <bits/ensure.h>
+#include <etos-idl/clock.hpp>
+#include <etos-idl/proc.hpp>
 #include <etos/clock.hpp>
 #include <etos/syscall.hpp>
 #include <mlibc/all-sysdeps.hpp>
@@ -31,15 +33,27 @@ const etos::ClockPage *ensure_clock_page() {
 	if (__atomic_compare_exchange_n(
 	        &g_state, &expected, kMapping, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
 	    )) {
-		auto map_res =
-		    etos::syscall(etos::dispatch(etos::CLOCK, etos::CALL_CLOCK_MAP, 13), etos::NO_SLOT);
-		__ensure(map_res.err == 0);
-		// perms = READ | WRITE (bits 0 and 1) — see etos::MemPerm.
-		auto mem_res = etos::syscall(
-		    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MAP_MEMORY, 0), map_res.a0, 0, 0b011
-		);
-		__ensure(mem_res.err == 0);
-		g_page = reinterpret_cast<const etos::ClockPage *>(mem_res.a0);
+		// `etos::CLOCK` is a borrowed, persistent per-process capability slot
+		// (like `etos::FS`/`etos::SELF_PROC`) — release the temporary
+		// wrapper immediately after the call so its destructor doesn't
+		// close it.
+		Clock clockObj(etos::CLOCK);
+		Memory mem(etos_idl::NO_SLOT);
+		uint64_t size = 0;
+		auto mapErr = clockObj.map(&mem, &size);
+		clockObj.release();
+		__ensure(mapErr.is_ok());
+
+		// Map.mem is a real capability the process should keep mapped, not
+		// something this function owns — release (not close) it after use,
+		// matching the original hand-rolled behavior.
+		Process self(etos::SELF_PROC);
+		uint64_t addr = 0;
+		auto err = self.map_memory(mem, 0, MemPermBits::Read | MemPermBits::Write, &addr);
+		mem.release();
+		self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+		__ensure(err.is_ok());
+		g_page = reinterpret_cast<const etos::ClockPage *>(addr);
 		__atomic_store_n(&g_state, kReady, __ATOMIC_RELEASE);
 	} else {
 		while (__atomic_load_n(&g_state, __ATOMIC_ACQUIRE) != kReady)

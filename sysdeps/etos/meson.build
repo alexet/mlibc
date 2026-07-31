@@ -2,6 +2,17 @@ sysdep_supported_options = {
 	'posix': true,
 }
 
+# Extra include dir for etos idlc's generated C++ IDL client (sysdeps.cpp's
+# `#include "etos-idl/fs.hpp"`) — see tools/build-mlibc.sh, which regenerates
+# this directory on every run and passes its path here rather than placing
+# generated files inside this submodule's own source tree (that would sit
+# inside a path builders/mlibc-build/build.rs already watches wholesale via
+# `rerun-if-changed`, perpetually re-triggering itself).
+etos_idl_include = get_option('etos_idl_include')
+if etos_idl_include != ''
+	add_project_arguments('-I' + etos_idl_include, language: ['cpp'])
+endif
+
 # The etos ELF loader applies only R_X86_64_RELATIVE relocations, so ifunc
 # routines (R_X86_64_IRELATIVE) cannot be used.
 sysdep_supports_ifunc = false

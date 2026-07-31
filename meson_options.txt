@@ -19,3 +19,5 @@ option('use_freestnd_hdrs', type : 'feature', value : 'auto',
 	description : 'Use freestnd-c{,xx}-hdrs instead of looking for compiler headers')
 option('ld_library_name', type: 'string', value: 'ld',
 	description: 'Name of the ld library to build. Defaults to "ld".')
+option('etos_idl_include', type: 'string', value: '',
+	description: 'Absolute path to etos idlc gen-cpp-client output (fs.hpp, etos_idl_runtime.hpp under an etos-idl/ subdir), added as an extra include dir for sysdeps/etos/sysdeps.cpp. Set by tools/build-mlibc.sh; empty disables.')

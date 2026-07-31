@@ -4,6 +4,9 @@
 #include <abi-bits/seek-whence.h>
 #include <abi-bits/vm-flags.h>
 #include <bits/ensure.h>
+#include <etos-idl/fs.hpp>
+#include <etos-idl/pipes.hpp>
+#include <etos-idl/proc.hpp>
 #include <etos/syscall.hpp>
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/fsfd_target.hpp>
@@ -53,10 +56,10 @@ SpinLock fsLock;
 uint32_t rootFolderSlot = etos::NO_SLOT; // lazily opened, guarded by fsLock
 OffsetEntry offsetTable[MAX_OPEN_FILES];
 
-// Close an object slot (etos's global RPC-close call, see thread.cpp for the
-// same pattern used to tear down thread objects).
+// Close an object slot, via the generated client's shared runtime (the same
+// global RPC-close call thread.cpp's own closeSlot-equivalent uses).
 void closeSlot(uint32_t slot) {
-	etos::syscall(etos::dispatch(etos::GLOBAL, etos::CALL_RPC_CLOSE, 4), etos::SELF_PROC, slot);
+	etos_idl::rpc_close(slot);
 }
 
 OffsetEntry *findEntryLocked(int fd) {
@@ -67,18 +70,40 @@ OffsetEntry *findEntryLocked(int fd) {
 	return nullptr;
 }
 
+// Any declared `App` error from a Folder.OpenFile/OpenFolder call maps to
+// ENOENT: real servers (kernel-native initfs, fatd, rootfsd) only ever
+// actually produce `NOT_FOUND` here (see idl/fs.idl's header comment) — the
+// other declared variants (NOT_A_FILE/NOT_A_FOLDER/PERMISSION_DENIED/
+// INVALID_NAME) aren't produced by any real server today, so there's nothing
+// finer to distinguish yet. A transport-level failure maps to EIO, matching
+// this function's previous raw-syscall behavior.
+template <typename E>
+int mapOpenErrno(const etos_idl::CallError<E> &err) {
+	return err.kind == etos_idl::ErrKind::App ? ENOENT : EIO;
+}
+
 // Open the process's FS-slot FileSystem's root Folder once and cache its
 // slot. Fails if the process wasn't `run`-spawned with a FileSystem
 // capability at the well-known `etos::FS` slot.
 bool ensureRootLocked() {
 	if (rootFolderSlot != etos::NO_SLOT)
 		return true;
-	auto r = etos::object_call_retrying(
-	    etos::dispatch(etos::FS, etos::CALL_FS_ROOT, 14), 0, 0, etos::NO_SLOT
-	);
-	if (r.err != 0)
+	// A zero-length `permissions` buffer still needs a non-null, aligned
+	// pointer: the kernel's generated dispatch builds a slice via
+	// `core::slice::from_raw_parts(ptr, len)`, which is UB (and trips a debug
+	// assertion) for a null `ptr` even when `len == 0`.
+	static const uint8_t kNoPermissions = 0;
+	// `etos::FS` is a borrowed, persistent per-process capability slot, not
+	// something this call owns — release the temporary wrapper immediately
+	// after the call so its destructor doesn't close it (see the matching
+	// comment on `dirBorrow` in resolvePathLocked for why this matters).
+	Folder root(etos::NO_SLOT);
+	FileSystem fs(etos::FS);
+	auto err = fs.root(&kNoPermissions, 0, &root);
+	fs.release();
+	if (!err.is_ok())
 		return false;
-	rootFolderSlot = static_cast<uint32_t>(r.a2);
+	rootFolderSlot = root.release();
 	return true;
 }
 
@@ -112,33 +137,56 @@ uint32_t resolvePathLocked(const char *pathname, int *err) {
 		size_t len = static_cast<size_t>(slash - pathname);
 		slash = (*slash == '/') ? slash : nullptr;
 		bool last = (slash == nullptr) || slash[1] == '\0';
-		uint16_t callIndex =
-		    last ? etos::CALL_FOLDER_OPEN_FILE : etos::CALL_FOLDER_OPEN_FOLDER;
 
-		auto r = etos::object_call_retrying(
-		    etos::dispatch(dir, callIndex, 14),
-		    reinterpret_cast<uint64_t>(pathname),
-		    len,
-		    etos::NO_SLOT,
-		    last ? etos::FS_OPEN_READ : 0
-		);
+		uint32_t nextSlot = etos::NO_SLOT;
+		bool ok;
+		// `dir` is a *borrowed* slot (the persistent root folder, or an
+		// intermediate directory this loop still owns via `dirIsRoot`/manual
+		// `closeSlot` below) — never construct a bare `Folder(dir)` temporary
+		// to call a method on it, since its destructor would close `dir` at
+		// the end of the full expression regardless of ownership. `.release()`
+		// it back immediately after the call instead (confirmed as a real
+		// bug: the very first `Folder(dir).open_file(...)` call closed the
+		// root folder slot as a side effect, so every subsequent lookup
+		// failed at the transport level with `err::BAD_SOURCE`).
+		Folder dirBorrow(dir);
+		if (last) {
+			File file(etos::NO_SLOT);
+			auto err2 = dirBorrow.open_file(
+			    reinterpret_cast<const uint8_t *>(pathname), len, OpenFlagsBits::Read, &file
+			);
+			dirBorrow.release();
+			ok = err2.is_ok();
+			if (!ok) {
+				if (!dirIsRoot)
+					closeSlot(dir);
+				*err = mapOpenErrno(err2);
+				return UINT32_MAX;
+			}
+			nextSlot = file.release();
+		} else {
+			Folder folder(etos::NO_SLOT);
+			auto err2 = dirBorrow.open_folder(
+			    reinterpret_cast<const uint8_t *>(pathname), len, &folder
+			);
+			dirBorrow.release();
+			ok = err2.is_ok();
+			if (!ok) {
+				if (!dirIsRoot)
+					closeSlot(dir);
+				*err = mapOpenErrno(err2);
+				return UINT32_MAX;
+			}
+			nextSlot = folder.release();
+		}
 
 		if (!dirIsRoot)
 			closeSlot(dir);
 
-		if (r.err != 0) {
-			*err = EIO;
-			return UINT32_MAX;
-		}
-		if (r.a0 != 0) {
-			*err = (r.a0 == etos::FS_ERR_READ_ONLY) ? EROFS : ENOENT;
-			return UINT32_MAX;
-		}
-
 		if (last)
-			return static_cast<uint32_t>(r.a2);
+			return nextSlot;
 
-		dir = static_cast<uint32_t>(r.a2);
+		dir = nextSlot;
 		dirIsRoot = false;
 		pathname = slash + 1;
 	}
@@ -179,20 +227,20 @@ int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *re
 		fsLock.unlock();
 		return isOpenFile ? EROFS : EBADF; // initfs is read-only
 	}
-	auto p = reinterpret_cast<uint64_t>(buf);
+	auto p = static_cast<const uint8_t *>(buf);
 	size_t written = 0;
 	while (written < size) {
-		// Poll first: a fresh write can report TARGET_NOT_READY while the
-		// pipe (or the user-space Tty behind it) has no space yet.
-		etos::syscall(etos::dispatch(etos::STDOUT, etos::CALL_PIPE_WRITE_POLL, 0));
-		auto r = etos::syscall(
-		    etos::dispatch(etos::STDOUT, etos::CALL_PIPE_WRITE, 2), p + written, size - written
-		);
-		if (r.err == etos::ERR_TARGET_NOT_READY)
-			continue;
-		if (r.err != 0)
+		// `WritePipe::write` retries internally (via `object_call_retrying`)
+		// while the pipe (or the user-space Tty behind it) reports
+		// TARGET_NOT_READY, so no separate poll-then-write loop is needed
+		// here — see etos_idl_runtime.hpp's `object_call_retrying`.
+		WritePipe stdout_(etos::STDOUT);
+		uint32_t n = 0;
+		auto err = stdout_.write(p + written, size - written, &n);
+		stdout_.release(); // STDOUT is a borrowed, persistent slot — never close it
+		if (!err.is_ok())
 			return EIO;
-		written += r.a0;
+		written += n;
 	}
 	*ret = static_cast<ssize_t>(written);
 	return 0;
@@ -211,38 +259,35 @@ int Sysdeps<Read>::operator()(int fd, void *buf, unsigned long size, long *ret) 
 		uint64_t offset = entry->offset;
 		fsLock.unlock();
 
-		auto r = etos::object_call_retrying(
-		    etos::dispatch(static_cast<uint32_t>(fd), etos::CALL_FILE_READ_AT, 1),
-		    reinterpret_cast<uint64_t>(buf),
-		    size,
-		    offset
-		);
-		if (r.err != 0)
+		File file(static_cast<uint32_t>(fd));
+		size_t readLen = 0;
+		auto err = file.read_at(offset, size, static_cast<uint8_t *>(buf), size, &readLen);
+		file.release(); // ownership of fd stays in offsetTable, not this temporary
+		if (!err.is_ok())
 			return EIO;
 
 		fsLock.lock();
 		entry = findEntryLocked(fd);
 		if (entry)
-			entry->offset += r.a1;
+			entry->offset += readLen;
 		fsLock.unlock();
 
-		*ret = static_cast<long>(r.a1);
+		*ret = static_cast<long>(readLen);
 		return 0;
 	}
 	while (true) {
-		etos::syscall(etos::dispatch(etos::STDIN, etos::CALL_PIPE_READ_POLL, 0));
-		auto r = etos::syscall(
-		    etos::dispatch(etos::STDIN, etos::CALL_PIPE_READ, 1),
-		    reinterpret_cast<uint64_t>(buf),
-		    size
-		);
-		if (r.err == etos::ERR_TARGET_NOT_READY)
-			continue;
-		if (r.err != 0)
+		// `ReadPipe::read` retries internally while the pipe reports
+		// TARGET_NOT_READY (see `Write`'s matching comment above), so no
+		// separate poll step is needed.
+		ReadPipe stdin_(etos::STDIN);
+		size_t readLen = 0;
+		auto err = stdin_.read(static_cast<uint8_t *>(buf), size, &readLen);
+		stdin_.release(); // STDIN is a borrowed, persistent slot — never close it
+		if (!err.is_ok())
 			return EIO;
-		if (r.a1 == 0 && size > 0)
+		if (readLen == 0 && size > 0)
 			continue; // spurious wakeup with no data: poll again
-		*ret = static_cast<long>(r.a1);
+		*ret = static_cast<long>(readLen);
 		return 0;
 	}
 }
@@ -260,24 +305,22 @@ int Sysdeps<TcbSet>::operator()(void *pointer) {
 
 int Sysdeps<AnonAllocate>::operator()(size_t size, void **pointer) {
 	uint64_t pages = (size + 0xFFF) >> 12;
-	auto r = etos::syscall(
-	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MAP_ANON, 0), pages, /*addr hint*/ 0,
-	    etos::MEM_PERM_READ | etos::MEM_PERM_WRITE
-	);
-	if (r.err != 0 || r.a0 == UINT64_MAX)
+	Process self(etos::SELF_PROC);
+	uint64_t addr = 0;
+	auto err = self.map_anon(pages, 0, MemPermBits::Read | MemPermBits::Write, &addr);
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+	if (!err.is_ok() || addr == UINT64_MAX)
 		return ENOMEM;
 	// The kernel zeroes fresh frames, as mlibc requires.
-	*pointer = reinterpret_cast<void *>(r.a0);
+	*pointer = reinterpret_cast<void *>(addr);
 	return 0;
 }
 
 int Sysdeps<AnonFree>::operator()(void *pointer, unsigned long size) {
 	uint64_t pages = (size + 0xFFF) >> 12;
-	etos::syscall(
-	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_UNMAP, 0),
-	    reinterpret_cast<uint64_t>(pointer),
-	    pages
-	);
+	Process self(etos::SELF_PROC);
+	self.unmap(reinterpret_cast<uint64_t>(pointer), pages);
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
 	return 0;
 }
 
@@ -299,10 +342,11 @@ int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offse
 		break;
 	case SEEK_END: {
 		fsLock.unlock();
-		auto r = etos::object_call_retrying(
-		    etos::dispatch(static_cast<uint32_t>(fd), etos::CALL_FILE_SIZE, 0)
-		);
-		if (r.err != 0 || r.a0 != 0)
+		File file(static_cast<uint32_t>(fd));
+		uint64_t fileSize = 0;
+		auto err = file.size(&fileSize);
+		file.release(); // ownership of fd stays in offsetTable, not this temporary
+		if (!err.is_ok())
 			return EIO;
 		fsLock.lock();
 		entry = findEntryLocked(fd);
@@ -310,7 +354,7 @@ int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offse
 			fsLock.unlock();
 			return EBADF;
 		}
-		base = r.a1;
+		base = fileSize;
 		break;
 	}
 	default:
@@ -416,24 +460,18 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int f
 		return ENOSYS;
 	}
 
-	// Wire `FileStat` layout (see utility/user_api/src/fs.rs): u64 size, u32
-	// is_dir, u32 padding.
-	uint8_t buf[16];
-	auto r = etos::object_call_retrying(
-	    etos::dispatch(slot, etos::CALL_FILE_STAT, 1), reinterpret_cast<uint64_t>(buf), sizeof(buf)
-	);
+	File file(slot);
+	FileStat st{};
+	auto err = file.stat(&st);
+	file.release(); // ownership of slot stays with the caller (fd or a one-shot path open)
 
 	int result = 0;
-	if (r.err != 0 || r.a2 != 0) {
+	if (!err.is_ok()) {
 		result = EIO;
 	} else {
-		uint64_t size;
-		uint32_t isDir;
-		memcpy(&size, buf, sizeof(size));
-		memcpy(&isDir, buf + sizeof(size), sizeof(isDir));
 		memset(statbuf, 0, sizeof(*statbuf));
-		statbuf->st_size = static_cast<off_t>(size);
-		statbuf->st_mode = (isDir ? S_IFDIR : S_IFREG) | 0444;
+		statbuf->st_size = static_cast<off_t>(st.size);
+		statbuf->st_mode = (st.is_dir ? S_IFDIR : S_IFREG) | 0444;
 		statbuf->st_nlink = 1;
 	}
 
@@ -452,7 +490,7 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int f
 // practice happens under large enough workloads (observed: Mesa's GLSL
 // compiler).
 //
-// etos's CALL_PROC_MAP_ANON has no PROT_NONE / lazily-committed-region
+// etos's Proc.MapAnon has no PROT_NONE / lazily-committed-region
 // concept (freshly mapped pages are always immediately backed) and no
 // MAP_FIXED support for re-mapping part of an existing region with
 // different permissions. MemoryAllocator::allocate's two-call pattern — (1)
@@ -485,64 +523,65 @@ int Sysdeps<VmMap>::operator()(void *addr, size_t length, int prot, int flags, i
 		return 0;
 	}
 
-	uint64_t perms = etos::MEM_PERM_READ;
+	MemPerm perms = MemPermBits::Read;
 	if (prot & PROT_WRITE)
-		perms |= etos::MEM_PERM_WRITE;
+		perms |= MemPermBits::Write;
 	if (prot & PROT_EXEC)
-		perms |= etos::MEM_PERM_EXECUTE;
+		perms |= MemPermBits::Execute;
 
 	uint64_t pages = (length + 0xFFF) >> 12;
-	auto r = etos::syscall(
-	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MAP_ANON, 0), pages, /*addr hint*/ 0, perms
-	);
-	if (r.err != 0)
-		return EACCES; // Write+Execute requested together
-	if (r.a0 == UINT64_MAX)
+	Process self(etos::SELF_PROC);
+	uint64_t mapped = 0;
+	auto err = self.map_anon(pages, 0, perms, &mapped);
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+	if (!err.is_ok()) {
+		if (err.kind == etos_idl::ErrKind::App)
+			return EACCES; // Write+Execute requested together
+		return EIO; // unexpected transport-level failure
+	}
+	if (mapped == UINT64_MAX)
 		return ENOMEM;
-	*window = reinterpret_cast<void *>(r.a0);
+	*window = reinterpret_cast<void *>(mapped);
 	return 0;
 }
-// Process::UNMAP forward-processes: it always reports success in `err`
-// (rax) and instead carries (pages_done, status) in (a0, a1) — `pages_done`
-// pages starting at `addr` were actually unmapped, and `status` is 0 only if
-// every requested page was. mlibc's own call sites (frigg's slab-pool
-// huge-object free, file_window, the debug allocator) always unmap exactly
-// what they mapped, so any `status != 0` here means the range wasn't (fully)
-// mapped to begin with — a real error, not a partial success to tolerate.
+// mlibc's own call sites (frigg's slab-pool huge-object free, file_window,
+// the debug allocator) always unmap exactly what they mapped, so any
+// declared `RegionError` here means the range wasn't (fully) mapped to begin
+// with — a real error, not a partial success to tolerate.
 int Sysdeps<VmUnmap>::operator()(void *pointer, size_t length) {
 	auto addr = reinterpret_cast<uintptr_t>(pointer);
 	if (!pointer || (addr & 0xFFF) != 0)
 		return EINVAL;
 
 	uint64_t pages = (length + 0xFFF) >> 12;
-	auto r = etos::syscall(etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_UNMAP, 0), addr, pages);
-	if (r.err != 0 || r.a1 != 0)
+	Process self(etos::SELF_PROC);
+	auto err = self.unmap(addr, pages);
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+	if (!err.is_ok())
 		return EINVAL;
 	return 0;
 }
-// Process::MPROTECT forward-processes exactly like UNMAP: `err` (rax) stays
-// 0 and the real outcome travels as (pages_done, status) in (a0, a1). Every
-// current caller (ld.so's RELRO-style "tighten after relocation" in
-// options/rtld/generic/linker.cpp, and JIT memory managers flipping a
-// just-written code section from RW to RX) reprotects exactly the range it
-// already owns, so any `status != 0` here means that range wasn't (fully)
-// mapped — a real error, not a partial success to tolerate.
+// Every current caller of Mprotect (ld.so's RELRO-style "tighten after
+// relocation" in options/rtld/generic/linker.cpp, and JIT memory managers
+// flipping a just-written code section from RW to RX) reprotects exactly the
+// range it already owns, so any declared `RegionError` here means that range
+// wasn't (fully) mapped — a real error, not a partial success to tolerate.
 int Sysdeps<VmProtect>::operator()(void *pointer, size_t length, int prot) {
 	auto addr = reinterpret_cast<uintptr_t>(pointer);
 	if (!pointer || (addr & 0xFFF) != 0)
 		return EINVAL;
 
-	uint64_t perms = etos::MEM_PERM_READ;
+	MemPerm perms = MemPermBits::Read;
 	if (prot & PROT_WRITE)
-		perms |= etos::MEM_PERM_WRITE;
+		perms |= MemPermBits::Write;
 	if (prot & PROT_EXEC)
-		perms |= etos::MEM_PERM_EXECUTE;
+		perms |= MemPermBits::Execute;
 
 	uint64_t pages = (length + 0xFFF) >> 12;
-	auto r = etos::syscall(
-	    etos::dispatch(etos::SELF_PROC, etos::CALL_PROC_MPROTECT, 0), addr, pages, perms
-	);
-	if (r.err != 0 || r.a1 != 0)
+	Process self(etos::SELF_PROC);
+	auto err = self.mprotect(addr, pages, perms);
+	self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+	if (!err.is_ok())
 		return EACCES;
 	return 0;
 }
