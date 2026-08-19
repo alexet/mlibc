@@ -305,6 +305,11 @@ double round(double __x);
 float roundf(float __x);
 long double roundl(long double __x);
 
+/* C23; GCC's __builtin_roundeven() falls back to calling this when it
+ * cannot be lowered to a single instruction, so it must exist regardless
+ * of whether user code calls it directly. */
+double roundeven(double __x);
+
 long lround(double __x);
 long lroundf(float __x);
 long lroundl(long double __x);
