@@ -497,14 +497,21 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int f
 // reserve pg_size+2*pageSize as PROT_NONE, (2) MAP_FIXED a
 // PROT_READ|PROT_WRITE sub-range of it, excluding one guard page — is
 // approximated rather than reproduced exactly: call (1) just performs a
-// real, fully-accessible mapping of the requested size (there is no way to
-// make it PROT_NONE), and call (2) (recognized by `addr` being non-null and
-// `flags` containing MAP_FIXED) is a no-op that reports success, since the
-// range it asks to "commit" already is. The practical effect is a working
-// allocator with one fewer enforced guard page than on a real POSIX target
-// — a debugging aid lost, not a correctness gap: the range from call (1) is
-// already mapped Read+Write (never Execute, see below), so there was no
-// extra guarantee call (2)'s narrower prot could have added anyway.
+// real mapping of the requested size (there is no way to make it truly
+// PROT_NONE — see below), and call (2) (recognized by `addr` being non-null
+// and `flags` containing MAP_FIXED) issues a real `Proc.Mprotect` over that
+// same range instead of a fresh mapping, applying `prot`'s *new*
+// permissions to it (same call `Sysdeps<VmProtect>` below makes for a
+// standalone `mprotect()`). This isn't just a guard-page nicety: callers
+// that legitimately reserve a range at reduced permissions and commit it to
+// something wider later (e.g. DPDK's `eal_get_virtual_area`, which reserves
+// with `PROT_NONE` then `MAP_FIXED`-commits the whole thing to
+// `PROT_READ|PROT_WRITE`) would otherwise silently keep call (1)'s
+// permissions forever and fault the first time they actually use the
+// memory — no-op'ing this call was only ever safe for callers (mlibc's own
+// allocator included) that happen to already request full access in call
+// (1), papering over the missing PROT_NONE support rather than genuinely
+// not needing call (2) to do anything.
 //
 // `prot` genuinely maps to the initial permissions now — PROT_EXEC included:
 // unlike a `Memory` object, anonymous memory's permission ceiling is
@@ -516,18 +523,26 @@ int Sysdeps<VmMap>::operator()(void *addr, size_t length, int prot, int flags, i
 	if (fd != -1 || !(flags & MAP_ANONYMOUS))
 		return ENOTSUP; // no file-backed mmap on etos
 
-	if (addr != nullptr && (flags & MAP_FIXED)) {
-		// "Commit" call over an already fully-mapped region from a prior
-		// anonymous call (see comment above): nothing to do.
-		*window = addr;
-		return 0;
-	}
-
 	MemPerm perms = MemPermBits::Read;
 	if (prot & PROT_WRITE)
 		perms |= MemPermBits::Write;
 	if (prot & PROT_EXEC)
 		perms |= MemPermBits::Execute;
+
+	if (addr != nullptr && (flags & MAP_FIXED)) {
+		// "Commit" call over an already-mapped region from a prior
+		// anonymous call (see comment above): actually apply the new
+		// permissions via mprotect rather than assuming call (1) already
+		// granted them.
+		uint64_t fixed_pages = (length + 0xFFF) >> 12;
+		Process fixed_self(etos::SELF_PROC);
+		auto protErr = fixed_self.mprotect(reinterpret_cast<uintptr_t>(addr), fixed_pages, perms);
+		fixed_self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
+		if (!protErr.is_ok())
+			return EACCES;
+		*window = addr;
+		return 0;
+	}
 
 	uint64_t pages = (length + 0xFFF) >> 12;
 	Process self(etos::SELF_PROC);
