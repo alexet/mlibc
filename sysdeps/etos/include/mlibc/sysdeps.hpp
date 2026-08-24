@@ -24,6 +24,7 @@ struct EtosSysdepTags :
 	VmUnmap,
 	VmProtect,
 	ClockGet,
+	Sleep,
 	Clone,
 	PrepareStack,
 	ThreadExit,

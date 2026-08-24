@@ -602,6 +602,25 @@ int Sysdeps<VmProtect>::operator()(void *pointer, size_t length, int prot) {
 }
 // ClockGet is implemented in generic/clock.cpp.
 
+// Backs sleep()/usleep()/nanosleep(). etos's `Sleep` global call (see
+// etos::CALL_SLEEP, already used the same way by generic/futex.cpp's
+// watchdog thread) takes whole milliseconds and always blocks for the
+// full duration -- there is no signal-delivery mechanism on etos that
+// could interrupt it early, so unlike a POSIX nanosleep() this can never
+// return a nonzero "time remaining": round the requested (secs, nanos) up
+// to the nearest whole millisecond (so a caller never sleeps for *less*
+// than it asked for) and always report zero remaining on return.
+int Sysdeps<Sleep>::operator()(time_t *secs, long *nanos) {
+	uint64_t ms = static_cast<uint64_t>(*secs) * 1000;
+	ms += (static_cast<uint64_t>(*nanos) + 999999) / 1000000;
+
+	etos::syscall(etos::dispatch(etos::GLOBAL, etos::CALL_SLEEP, 0), ms);
+
+	*secs = 0;
+	*nanos = 0;
+	return 0;
+}
+
 // etos has no UNIX-style user/group accounts or process-id numbering yet --
 // every process is just a capability-holding object, not a numbered entry in
 // a process table. These are needed because some library code (e.g. Mesa's
