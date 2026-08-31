@@ -49,7 +49,10 @@ const etos::ClockPage *ensure_clock_page() {
 		// matching the original hand-rolled behavior.
 		Process self(etos::SELF_PROC);
 		uint64_t addr = 0;
-		auto err = self.map_memory(mem, 0, MemPermBits::Read | MemPermBits::Write, &addr);
+		// Read-only: the clock page is one frame shared by every process
+		// holding a `Clock`, and the kernel's `ClockMemory` caps it at Read,
+		// so asking for Write here would fail the mapping outright.
+		auto err = self.map_memory(mem, 0, MemPermBits::Read, &addr);
 		mem.release();
 		self.release(); // SELF_PROC is a borrowed, persistent slot — never close it
 		__ensure(err.is_ok());
