@@ -21,10 +21,17 @@ inline constexpr uint32_t NO_SLOT = 0xFFFF'FFFF;
 inline constexpr uint32_t STDIN = 0;
 inline constexpr uint32_t STDOUT = 1;
 inline constexpr uint32_t SELF_PROC = 2;
-// The read-only initfs FileSystem, when the process was `run`-spawned by init
-// (see init/src/main.rs's cmd_run) — not present for every process.
-inline constexpr uint32_t FS = 3;
-inline constexpr uint32_t CLOCK = 4;
+// The system Log (idl/log.idl), served by services/logd. Every process is born
+// with one, exactly as it is with the three above — see
+// utility/user-util/src/log.rs's module doc. mlibc itself doesn't log through
+// it (a C/C++ program's output goes to stdout); the slot is named here because
+// its existence is what pushes FS and CLOCK below up by one.
+inline constexpr uint32_t LOG = 3;
+// The root FileSystem, when the process was `run`-spawned by init (see
+// init/src/main.rs's cmd_run, whose RUN_FS_SLOT/RUN_CLOCK_SLOT are these two
+// numbers) — not present for every process.
+inline constexpr uint32_t FS = 4;
+inline constexpr uint32_t CLOCK = 5;
 
 // Global call indices — no per-object protocol exists for these (they
 // dispatch against the GLOBAL pseudo-slot, not an object), so idlc has
