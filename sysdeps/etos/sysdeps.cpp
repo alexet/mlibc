@@ -221,9 +221,11 @@ int Sysdeps<Isatty>::operator()(int fd) {
 }
 
 int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *ret) {
-	// There is no stderr object: fd 1 maps to the STDOUT write pipe. Any other
-	// fd is looked up in the filesystem offset table (see resolvePathLocked).
-	if (fd != etos::STDOUT) {
+	// There is no stderr object: both fd 1 and fd 2 map to the STDOUT write
+	// pipe (see etos::STDERR_FD for why fd 2 is not simply rejected). Any
+	// other fd is looked up in the filesystem offset table (see
+	// resolvePathLocked).
+	if (fd != static_cast<int>(etos::STDOUT) && fd != etos::STDERR_FD) {
 		fsLock.lock();
 		bool isOpenFile = findEntryLocked(fd) != nullptr;
 		fsLock.unlock();
@@ -331,7 +333,9 @@ int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offse
 	OffsetEntry *entry = findEntryLocked(fd);
 	if (!entry) {
 		fsLock.unlock();
-		return (fd == etos::STDIN || fd == etos::STDOUT) ? ESPIPE : EBADF;
+		return (fd == etos::STDIN || fd == etos::STDOUT || fd == etos::STDERR_FD)
+		           ? ESPIPE
+		           : EBADF;
 	}
 
 	uint64_t base;
@@ -385,7 +389,8 @@ void Sysdeps<Exit>::operator()(int status) {
 int Sysdeps<Close>::operator()(int fd) {
 	// stdin/stdout/self-proc are not individually closeable through this call
 	// (matches Isatty's blanket tty treatment above).
-	if (fd == etos::STDIN || fd == etos::STDOUT || fd == static_cast<int>(etos::SELF_PROC))
+	if (fd == etos::STDIN || fd == etos::STDOUT || fd == etos::STDERR_FD ||
+	    fd == static_cast<int>(etos::SELF_PROC))
 		return 0;
 
 	fsLock.lock();
