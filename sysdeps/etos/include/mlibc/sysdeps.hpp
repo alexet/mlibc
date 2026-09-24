@@ -35,7 +35,8 @@ struct EtosSysdepTags :
 	GetEgid,
 	Kill,
 	OpenDir,
-	ReadEntries
+	ReadEntries,
+	Uname
 {};
 
 template<typename Tag>

@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 
 #define STUB()                                                                                     \
 	({                                                                                             \
@@ -872,6 +873,32 @@ int Sysdeps<Kill>::operator()(pid_t pid, int sig) {
 			break;
 		}
 	}
+	return 0;
+}
+
+// Fixed stand-in values, same convention as GetPid/GetUid/GetGid above:
+// etos has no real per-boot kernel version/hostname reporting wired up yet,
+// so this is honest static content rather than a workaround for a missing
+// syscall — busybox's `uname` (and anything else calling uname(2)) needs
+// *a* successful response more than it needs a real one.
+int Sysdeps<Uname>::operator()(struct utsname *buf) {
+	auto fill = [](char *dst, size_t cap, const char *src) {
+		size_t len = strlen(src);
+		if (len >= cap)
+			len = cap - 1;
+		memcpy(dst, src, len);
+		dst[len] = 0;
+	};
+	fill(buf->sysname, sizeof(buf->sysname), "etos");
+	fill(buf->nodename, sizeof(buf->nodename), "etos");
+	fill(buf->release, sizeof(buf->release), "0.1.0");
+	fill(buf->version, sizeof(buf->version), "etos");
+	fill(buf->machine, sizeof(buf->machine), "x86_64");
+#if defined(_GNU_SOURCE)
+	fill(buf->domainname, sizeof(buf->domainname), "");
+#else
+	fill(buf->__domainname, sizeof(buf->__domainname), "");
+#endif
 	return 0;
 }
 
