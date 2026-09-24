@@ -2,6 +2,7 @@
 #include <abi-bits/errno.h>
 #include <abi-bits/fcntl.h>
 #include <abi-bits/seek-whence.h>
+#include <abi-bits/signal.h>
 #include <abi-bits/vm-flags.h>
 #include <bits/ensure.h>
 #include <etos-idl/fs.hpp>
@@ -642,6 +643,33 @@ gid_t Sysdeps<GetGid>::operator()() {
 	return 0;
 }
 gid_t Sysdeps<GetEgid>::operator()() {
+	return 0;
+}
+
+// etos has no cross-process signal-delivery mechanism at all yet (see
+// GetPid's comment on the fixed pid=1 stand-in) — but `raise(sig)`
+// (self-signal, e.g. a handler re-raising the signal it caught to die with
+// the "right" status) is common enough in otherwise single-process tools
+// that leaving this a hard link failure would block them outright. Only the
+// well-known self-pid case is handled, and only for the signals whose
+// default action is process termination: map those to etos's real process
+// exit. Any other target/signal is a no-op success — there's no other
+// process to signal, and no delivery mechanism to fail to honor.
+int Sysdeps<Kill>::operator()(pid_t pid, int sig) {
+	if (pid == 1) {
+		switch (sig) {
+		case SIGKILL:
+		case SIGTERM:
+		case SIGABRT:
+		case SIGQUIT:
+		case SIGINT:
+		case SIGHUP:
+			etos::syscall(etos::dispatch(etos::GLOBAL, etos::CALL_EXIT_PROCESS, 0));
+			__builtin_unreachable();
+		default:
+			break;
+		}
+	}
 	return 0;
 }
 
