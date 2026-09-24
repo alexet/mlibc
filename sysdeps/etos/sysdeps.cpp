@@ -146,8 +146,31 @@ bool ensureRootLocked() {
 	return true;
 }
 
-// Resolve `pathname` (relative to the FS root — leading `/` is stripped;
-// etos `Folder` names reject `/`, `.`, `..` outright, so there is no `..`
+// Skip leading '/' and any "./" segments, reducing a bare "." (or "./",
+// "././", etc.) to the empty string — the same "already at the root" case
+// an all-slashes path already reduces to. etos has no per-process cwd/chdir
+// concept, so "." always means "the FS root" here; but no `Folder` actually
+// has a child literally named ".", so leaving one as an ordinary path
+// component would always fail with NOT_FOUND rather than resolving to the
+// root. This is what makes `ls` (no args resolves to ".") and `cat ./foo`
+// style paths work instead of failing outright — confirmed as a real bug via
+// a QEMU boot where `ls` silently failed to open "." and printed nothing
+// (compounded by etos having no real stderr, so the failure was invisible).
+const char *skipDotSlash(const char *pathname) {
+	while (true) {
+		while (*pathname == '/')
+			pathname++;
+		if (pathname[0] == '.' && (pathname[1] == '/' || pathname[1] == '\0')) {
+			pathname += 1;
+			continue;
+		}
+		break;
+	}
+	return pathname;
+}
+
+// Resolve `pathname` (relative to the FS root — leading `/` and `./` are
+// stripped; etos `Folder` names reject `..` outright, so there is no `..`
 // traversal to handle) to a freshly-opened `File` object slot. Intermediate
 // directory slots are closed as the walk descends; only the final File slot
 // is left open. Returns `UINT32_MAX` and sets `*err` on failure.
@@ -156,8 +179,7 @@ uint32_t resolvePathLocked(const char *pathname, int *err) {
 		*err = ENOENT;
 		return UINT32_MAX;
 	}
-	while (*pathname == '/')
-		pathname++;
+	pathname = skipDotSlash(pathname);
 	if (*pathname == '\0') {
 		*err = ENOENT;
 		return UINT32_MAX;
@@ -244,8 +266,7 @@ uint32_t resolveFolderPathLocked(const char *pathname, int *err) {
 		*err = ENOENT;
 		return UINT32_MAX;
 	}
-	while (*pathname == '/')
-		pathname++;
+	pathname = skipDotSlash(pathname);
 	if (*pathname == '\0') {
 		// The bare root itself — hand back a fresh, independently-owned dup of
 		// `rootFolderSlot` rather than that persistent slot directly, so the
@@ -656,9 +677,30 @@ int Sysdeps<Stat>::operator()(fsfd_target fsfdt, int fd, const char *path, int f
 		fsLock.lock();
 		int err = 0;
 		slot = resolvePathLocked(path, &err);
+		if (slot == UINT32_MAX) {
+			// Not a real bug in resolvePathLocked: a `File` object can never
+			// represent a directory on etos (see fatd's open_file_blocking,
+			// which rejects a directory entry with NotAFile, and the
+			// kernel-native initfs's equivalent), so this always fails for a
+			// directory path. Try resolving it as a folder instead before
+			// giving up -- there's no Folder.Stat() RPC to ask for real
+			// metadata (idl/fs.idl declares none), so this synthesizes a
+			// minimal directory stat once resolution itself succeeds. Needed
+			// for stat()/lstat() on "." (or any directory) to work at all:
+			// found via busybox's `ls`, which stats its target before ever
+			// calling opendir() and silently failed here every time.
+			int folderErr = 0;
+			uint32_t folderSlot = resolveFolderPathLocked(path, &folderErr);
+			fsLock.unlock();
+			if (folderSlot == UINT32_MAX)
+				return err; // report the original file-resolution error
+			closeSlot(folderSlot);
+			memset(statbuf, 0, sizeof(*statbuf));
+			statbuf->st_mode = S_IFDIR | 0555;
+			statbuf->st_nlink = 1;
+			return 0;
+		}
 		fsLock.unlock();
-		if (slot == UINT32_MAX)
-			return err;
 		opened = true;
 	} else {
 		return ENOSYS;
