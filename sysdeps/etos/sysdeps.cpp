@@ -5,6 +5,7 @@
 #include <abi-bits/signal.h>
 #include <abi-bits/vm-flags.h>
 #include <bits/ensure.h>
+#include <dirent.h>
 #include <etos-idl/fs.hpp>
 #include <etos-idl/pipes.hpp>
 #include <etos-idl/proc.hpp>
@@ -56,6 +57,42 @@ struct OffsetEntry {
 SpinLock fsLock;
 uint32_t rootFolderSlot = etos::NO_SLOT; // lazily opened, guarded by fsLock
 OffsetEntry offsetTable[MAX_OPEN_FILES];
+
+// ── directories: OpenDir/ReadEntries (opendir/readdir) ─────────────────────
+//
+// Separate from `offsetTable` above: a directory has no byte offset to
+// track (idl/fs.idl's `DirStream.Next()` is itself the whole iteration
+// cursor, server-side), so the only per-open state is which `DirStream`
+// object slot backs a given fd. Kept in its own small table, guarded by the
+// same `fsLock`, rather than reusing `OffsetEntry` for a field it'd never
+// use.
+constexpr size_t MAX_OPEN_DIRS = 16;
+
+struct DirEntryHandle {
+	bool used = false;
+	uint32_t fd = 0;
+	uint32_t dirStreamSlot = etos::NO_SLOT;
+};
+
+DirEntryHandle dirTable[MAX_OPEN_DIRS];
+
+// A directory "fd" here is never a real object-table slot (unlike a file
+// fd, which *is* the File object's slot directly — see this section's own
+// header comment) — it's a synthetic index into `dirTable`. Offsetting by
+// a large constant keeps it from ever colliding with a real slot number
+// (small positive integers, assigned low-to-high by the kernel) so a
+// caller passing a directory fd into a file-fd path (or vice versa) fails
+// a lookup instead of aliasing some unrelated open file.
+constexpr uint32_t DIR_FD_BASE = 0x40000000;
+
+DirEntryHandle *findDirEntryLocked(int fd) {
+	if (static_cast<uint32_t>(fd) < DIR_FD_BASE)
+		return nullptr;
+	uint32_t idx = static_cast<uint32_t>(fd) - DIR_FD_BASE;
+	if (idx >= MAX_OPEN_DIRS || !dirTable[idx].used)
+		return nullptr;
+	return &dirTable[idx];
+}
 
 // Close an object slot, via the generated client's shared runtime (the same
 // global RPC-close call thread.cpp's own closeSlot-equivalent uses).
@@ -181,6 +218,70 @@ uint32_t resolvePathLocked(const char *pathname, int *err) {
 			nextSlot = folder.release();
 		}
 
+		if (!dirIsRoot)
+			closeSlot(dir);
+
+		if (last)
+			return nextSlot;
+
+		dir = nextSlot;
+		dirIsRoot = false;
+		pathname = slash + 1;
+	}
+}
+
+// Like `resolvePathLocked`, but always resolves the *last* path component as
+// a `Folder` (via `open_folder`) rather than switching to `open_file` at the
+// leaf — what `OpenDir` needs (a directory listing can only ever come from a
+// `Folder`'s own `List()`), whereas `resolvePathLocked` exists for `Open`,
+// which always wants a `File`. Kept as its own function rather than adding a
+// "resolve as folder" flag to `resolvePathLocked`: that function is already
+// covered by the fsdemo/init-boot path and isn't worth risking a regression
+// in for this addition.
+uint32_t resolveFolderPathLocked(const char *pathname, int *err) {
+	if (!ensureRootLocked()) {
+		*err = ENOENT;
+		return UINT32_MAX;
+	}
+	while (*pathname == '/')
+		pathname++;
+	if (*pathname == '\0') {
+		// The bare root itself — hand back a fresh, independently-owned dup of
+		// `rootFolderSlot` rather than that persistent slot directly, so the
+		// caller (OpenDir) can close it like any other resolved folder without
+		// tearing down the cached root.
+		Folder rootBorrow(rootFolderSlot);
+		Folder dup = rootBorrow.try_clone();
+		rootBorrow.release();
+		if (dup.slot() == etos::NO_SLOT) {
+			*err = EIO;
+			return UINT32_MAX;
+		}
+		return dup.release();
+	}
+
+	uint32_t dir = rootFolderSlot;
+	bool dirIsRoot = true;
+
+	while (true) {
+		const char *slash = pathname;
+		while (*slash != '\0' && *slash != '/')
+			slash++;
+		size_t len = static_cast<size_t>(slash - pathname);
+		slash = (*slash == '/') ? slash : nullptr;
+		bool last = (slash == nullptr) || slash[1] == '\0';
+
+		Folder dirBorrow(dir);
+		Folder folder(etos::NO_SLOT);
+		auto err2 = dirBorrow.open_folder(reinterpret_cast<const uint8_t *>(pathname), len, &folder);
+		dirBorrow.release();
+		if (!err2.is_ok()) {
+			if (!dirIsRoot)
+				closeSlot(dir);
+			*err = mapOpenErrno(err2);
+			return UINT32_MAX;
+		}
+		uint32_t nextSlot = folder.release();
 		if (!dirIsRoot)
 			closeSlot(dir);
 
@@ -387,7 +488,19 @@ int Sysdeps<Close>::operator()(int fd) {
 	if (fd == etos::STDIN || fd == etos::STDOUT || fd == static_cast<int>(etos::SELF_PROC))
 		return 0;
 
+	// A directory "fd" (see the "directories: OpenDir/ReadEntries" section
+	// above) is never a real object slot, so it must be checked, and freed,
+	// separately from the real-slot path below (which would otherwise try to
+	// `closeSlot()` a synthetic fd number that names no real object).
 	fsLock.lock();
+	if (DirEntryHandle *dirEntry = findDirEntryLocked(fd)) {
+		uint32_t streamSlot = dirEntry->dirStreamSlot;
+		dirEntry->used = false;
+		fsLock.unlock();
+		closeSlot(streamSlot);
+		return 0;
+	}
+
 	OffsetEntry *entry = findEntryLocked(fd);
 	if (!entry) {
 		fsLock.unlock();
@@ -400,6 +513,95 @@ int Sysdeps<Close>::operator()(int fd) {
 	return 0;
 }
 // FutexWake/FutexWait are implemented in generic/futex.cpp.
+
+// ── directories: OpenDir/ReadEntries ─────────────────────────────────────
+//
+// Backs opendir()/readdir() (mlibc's generic options/posix/generic/
+// dirent.cpp) on top of idl/fs.idl's Folder.List() -> DirStream.Next()
+// capability, the same real, server-implemented (kernel-native initfs,
+// fatd, rootfsd) protocol resolvePathLocked/Open already use for files.
+// `readdir()` calls `ReadEntries` to refill its own internal 2048-byte
+// buffer whenever it runs out of already-decoded entries, so entries don't
+// need to be produced one at a time all the way up to libc's caller — but
+// on the wire there both is, and can only be, one DirStream.Next() RPC per
+// entry (see idl/fs.idl's own header comment on why List() returns a
+// DirStream instead of a batch reply), so this loops calling Next() until
+// either the caller's buffer is full or the stream reports DirIterDone.
+int Sysdeps<OpenDir>::operator()(const char *path, int *fd) {
+	fsLock.lock();
+	int err = 0;
+	uint32_t folderSlot = resolveFolderPathLocked(path, &err);
+	if (folderSlot == UINT32_MAX) {
+		fsLock.unlock();
+		return err;
+	}
+
+	Folder folderBorrow(folderSlot);
+	DirStream stream(etos::NO_SLOT);
+	auto err2 = folderBorrow.list(&stream);
+	folderBorrow.release();
+	closeSlot(folderSlot); // the folder slot itself isn't needed once we have its DirStream
+
+	if (!err2.is_ok()) {
+		fsLock.unlock();
+		return EIO; // Folder.List() declares no App error today (idl/fs.idl)
+	}
+
+	for (auto &e : dirTable) {
+		if (!e.used) {
+			e.used = true;
+			e.dirStreamSlot = stream.release();
+			e.fd = DIR_FD_BASE + static_cast<uint32_t>(&e - dirTable);
+			*fd = static_cast<int>(e.fd);
+			fsLock.unlock();
+			return 0;
+		}
+	}
+	fsLock.unlock();
+	return EMFILE; // `stream`'s destructor closes its slot: no dirTable entry took it
+}
+
+int Sysdeps<ReadEntries>::operator()(int handle, void *buffer, size_t max_size, size_t *bytes_read) {
+	fsLock.lock();
+	DirEntryHandle *entry = findDirEntryLocked(handle);
+	if (!entry) {
+		fsLock.unlock();
+		return EBADF;
+	}
+	uint32_t streamSlot = entry->dirStreamSlot;
+	fsLock.unlock();
+
+	size_t used = 0;
+	uint8_t *out = static_cast<uint8_t *>(buffer);
+	while (used + sizeof(struct dirent) <= max_size) {
+		DirStream streamBorrow(streamSlot);
+		DirEntryInfo info{};
+		uint8_t nameBuf[__MLIBC_NAME_MAX + 1];
+		size_t nameLen = 0;
+		auto err = streamBorrow.next(&info, nameBuf, sizeof(nameBuf), &nameLen);
+		streamBorrow.release();
+		if (!err.is_ok())
+			break; // DirIterDone (the only declared error) -- end of directory
+
+		if (nameLen > __MLIBC_NAME_MAX)
+			nameLen = __MLIBC_NAME_MAX; // defensive: server should never send more
+		auto *ent = reinterpret_cast<struct dirent *>(out + used);
+		// etos has no real inode numbers; a fixed non-zero value keeps any
+		// caller that (wrongly, but commonly) skips d_ino==0 entries working.
+		ent->d_ino = 1;
+		// The real iteration cursor lives server-side in the DirStream, not
+		// in a seek offset a client could round-trip back in -- there's
+		// nothing meaningful to put here.
+		ent->d_off = 0;
+		ent->d_reclen = static_cast<reclen_t>(sizeof(struct dirent));
+		ent->d_type = info.is_dir ? DT_DIR : DT_REG;
+		memcpy(ent->d_name, nameBuf, nameLen);
+		ent->d_name[nameLen] = '\0';
+		used += sizeof(struct dirent);
+	}
+	*bytes_read = used;
+	return 0;
+}
 
 // Only O_RDONLY against the read-only initfs FileSystem (well-known slot
 // `etos::FS`, handed to `run`-spawned processes by init's `cmd_run`) is

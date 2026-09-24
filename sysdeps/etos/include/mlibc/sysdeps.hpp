@@ -33,7 +33,9 @@ struct EtosSysdepTags :
 	GetEuid,
 	GetGid,
 	GetEgid,
-	Kill
+	Kill,
+	OpenDir,
+	ReadEntries
 {};
 
 template<typename Tag>
