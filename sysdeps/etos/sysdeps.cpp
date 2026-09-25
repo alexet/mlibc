@@ -110,12 +110,14 @@ OffsetEntry *findEntryLocked(int fd) {
 }
 
 // Any declared `App` error from a Folder.OpenFile/OpenFolder call maps to
-// ENOENT: real servers (kernel-native initfs, fatd, rootfsd) only ever
-// actually produce `NOT_FOUND` here (see idl/fs.idl's header comment) — the
-// other declared variants (NOT_A_FILE/NOT_A_FOLDER/PERMISSION_DENIED/
-// INVALID_NAME) aren't produced by any real server today, so there's nothing
-// finer to distinguish yet. A transport-level failure maps to EIO, matching
-// this function's previous raw-syscall behavior.
+// ENOENT: real servers almost always produce `NOT_FOUND` here (see
+// idl/fs.idl's header comment). The one exception is rootfsd answering
+// `OpenFile` on a mountpoint with `NOT_A_FILE` — a directory, so the open
+// fails either way and ENOENT is not a misreport, just less specific than
+// EISDIR would be. The remaining declared variants (NOT_A_FOLDER/
+// PERMISSION_DENIED/INVALID_NAME) aren't produced by any real server today,
+// so there's nothing finer to distinguish yet. A transport-level failure maps
+// to EIO, matching this function's previous raw-syscall behavior.
 template <typename E>
 int mapOpenErrno(const etos_idl::CallError<E> &err) {
 	return err.kind == etos_idl::ErrKind::App ? ENOENT : EIO;
@@ -343,9 +345,11 @@ int Sysdeps<Isatty>::operator()(int fd) {
 }
 
 int Sysdeps<Write>::operator()(int fd, void const *buf, size_t size, ssize_t *ret) {
-	// There is no stderr object: fd 1 maps to the STDOUT write pipe. Any other
-	// fd is looked up in the filesystem offset table (see resolvePathLocked).
-	if (fd != etos::STDOUT) {
+	// There is no stderr object: both fd 1 and fd 2 map to the STDOUT write
+	// pipe (see etos::STDERR_FD for why fd 2 is not simply rejected). Any
+	// other fd is looked up in the filesystem offset table (see
+	// resolvePathLocked).
+	if (fd != static_cast<int>(etos::STDOUT) && fd != etos::STDERR_FD) {
 		fsLock.lock();
 		bool isOpenFile = findEntryLocked(fd) != nullptr;
 		fsLock.unlock();
@@ -453,7 +457,9 @@ int Sysdeps<Seek>::operator()(int fd, off_t offset, int whence, off_t *new_offse
 	OffsetEntry *entry = findEntryLocked(fd);
 	if (!entry) {
 		fsLock.unlock();
-		return (fd == etos::STDIN || fd == etos::STDOUT) ? ESPIPE : EBADF;
+		return (fd == etos::STDIN || fd == etos::STDOUT || fd == etos::STDERR_FD)
+		           ? ESPIPE
+		           : EBADF;
 	}
 
 	uint64_t base;
@@ -507,7 +513,8 @@ void Sysdeps<Exit>::operator()(int status) {
 int Sysdeps<Close>::operator()(int fd) {
 	// stdin/stdout/self-proc are not individually closeable through this call
 	// (matches Isatty's blanket tty treatment above).
-	if (fd == etos::STDIN || fd == etos::STDOUT || fd == static_cast<int>(etos::SELF_PROC))
+	if (fd == etos::STDIN || fd == etos::STDOUT || fd == etos::STDERR_FD ||
+	    fd == static_cast<int>(etos::SELF_PROC))
 		return 0;
 
 	// A directory "fd" (see the "directories: OpenDir/ReadEntries" section
