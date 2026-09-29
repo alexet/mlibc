@@ -951,17 +951,4 @@ int Sysdeps<Uname>::operator()(struct utsname *buf) {
 	return 0;
 }
 
-// posix_spawn, directly (no fork/exec: etos has neither). Spawning a process
-// here means loading an ELF image into a fresh `Proc` and wiring its
-// capability slots, which today only exists as Rust (`etos_user_util`'s
-// `spawn_process_with_caps`) and isn't reachable from mlibc — so this is a
-// stub that reports ENOSYS. It is the seam a real implementation plugs into;
-// nothing above it (posix_spawn/posix_spawnp, file-actions, attrs) needs to
-// change. Returns an errno value rather than setting errno, per posix_spawn.
-int Sysdeps<PosixSpawn>::operator()(pid_t *__restrict, const char *__restrict,
-		const posix_spawn_file_actions_t *, const posix_spawnattr_t *__restrict,
-		char *const[], char *const[], bool) {
-	return ENOSYS;
-}
-
 } // namespace mlibc

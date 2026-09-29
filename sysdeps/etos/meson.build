@@ -29,6 +29,7 @@ libc_sources += files(
 	'generic/entropy.cpp',
 	'generic/entry.cpp',
 	'generic/futex.cpp',
+	'generic/spawn.cpp',
 	'generic/thread.cpp',
 	'sysdeps.cpp',
 	'crt-x86_64/thread-entry.S',

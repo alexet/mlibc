@@ -38,7 +38,8 @@ struct EtosSysdepTags :
 	ReadEntries,
 	Uname,
 	GetEntropy,
-	PosixSpawn
+	PosixSpawn,
+	Waitpid
 {};
 
 template<typename Tag>
