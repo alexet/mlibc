@@ -476,6 +476,12 @@ struct TimerGetoverrun {};
 struct Times {};
 // int sys_uname(struct utsname *buf);
 struct Uname {};
+// int sys_posix_spawn(pid_t *__restrict pid, const char *__restrict path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *__restrict attr, char *const argv[], char *const envp[], bool search_path);
+// Optional. If a port provides it, posix_spawn/posix_spawnp call it directly
+// instead of emulating spawn with fork + exec (search_path selects PATH lookup
+// of `path`, i.e. posix_spawnp). Returns 0 or a positive errno value, like
+// posix_spawn itself, and does not touch errno.
+struct PosixSpawn {};
 // int sys_pause();
 struct Pause {};
 // int sys_setresuid(uid_t ruid, uid_t euid, uid_t suid);

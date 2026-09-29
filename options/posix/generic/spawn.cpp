@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 
 #include <bits/ensure.h>
+#include <mlibc/all-sysdeps.hpp>
 #include <mlibc/debug.hpp>
 
 /*
@@ -188,7 +189,7 @@ fail:
 	_exit(127);
 }
 
-int posix_spawn(pid_t *__restrict res, const char *__restrict path,
+static int spawn_with_fork(pid_t *__restrict res, const char *__restrict path,
 		const posix_spawn_file_actions_t *file_actions,
 		const posix_spawnattr_t *__restrict attrs,
 		char *const argv[], char *const envp[]) {
@@ -247,6 +248,17 @@ fail:
 	pthread_setcancelstate(cs, nullptr);
 
 	return ec;
+}
+
+int posix_spawn(pid_t *__restrict res, const char *__restrict path,
+		const posix_spawn_file_actions_t *file_actions,
+		const posix_spawnattr_t *__restrict attrs,
+		char *const argv[], char *const envp[]) {
+	if constexpr (mlibc::IsImplemented<PosixSpawn>) {
+		return mlibc::sysdep<PosixSpawn>(res, path, file_actions, attrs, argv, envp, false);
+	} else {
+		return spawn_with_fork(res, path, file_actions, attrs, argv, envp);
+	}
 }
 
 int posix_spawnattr_init(posix_spawnattr_t *attr) {
@@ -367,10 +379,14 @@ int posix_spawnp(pid_t *__restrict pid, const char *__restrict file,
 		const posix_spawn_file_actions_t *file_actions,
 		const posix_spawnattr_t *__restrict attrp,
 		char *const argv[], char *const envp[]) {
-	posix_spawnattr_t spawnp_attr = {};
-	if(attrp)
-		spawnp_attr = *attrp;
-	spawnp_attr.__fn = (void *)execvpe;	
-	return posix_spawn(pid, file, file_actions, &spawnp_attr, argv, envp);
+	if constexpr (mlibc::IsImplemented<PosixSpawn>) {
+		return mlibc::sysdep<PosixSpawn>(pid, file, file_actions, attrp, argv, envp, true);
+	} else {
+		posix_spawnattr_t spawnp_attr = {};
+		if(attrp)
+			spawnp_attr = *attrp;
+		spawnp_attr.__fn = (void *)execvpe;
+		return spawn_with_fork(pid, file, file_actions, &spawnp_attr, argv, envp);
+	}
 }
 

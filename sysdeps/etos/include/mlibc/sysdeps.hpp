@@ -37,7 +37,8 @@ struct EtosSysdepTags :
 	OpenDir,
 	ReadEntries,
 	Uname,
-	GetEntropy
+	GetEntropy,
+	PosixSpawn
 {};
 
 template<typename Tag>

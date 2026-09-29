@@ -21,6 +21,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if __MLIBC_POSIX_OPTION
+#include <spawn.h>
+#endif
+
 #include <mlibc/sysdep-tags.hpp>
 
 namespace mlibc {
@@ -225,6 +229,7 @@ SYSDEP_FUNC(TimerDelete, timer_t t);
 SYSDEP_FUNC(TimerGetoverrun, timer_t t, int *out);
 SYSDEP_FUNC(Times, struct tms *tms, clock_t *out);
 SYSDEP_FUNC(Uname, struct utsname *buf);
+SYSDEP_FUNC(PosixSpawn, pid_t *__restrict pid, const char *__restrict path, const posix_spawn_file_actions_t *file_actions, const posix_spawnattr_t *__restrict attr, char *const argv[], char *const envp[], bool search_path);
 SYSDEP_FUNC(Pause);
 SYSDEP_FUNC(SetResuid, uid_t ruid, uid_t euid, uid_t suid);
 SYSDEP_FUNC(SetResgid, gid_t rgid, gid_t egid, gid_t sgid);
