@@ -26,6 +26,7 @@ rtld_include_dirs += include_directories('include')
 
 libc_sources += files(
 	'generic/clock.cpp',
+	'generic/entropy.cpp',
 	'generic/entry.cpp',
 	'generic/futex.cpp',
 	'generic/thread.cpp',
