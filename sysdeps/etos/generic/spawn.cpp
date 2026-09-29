@@ -12,7 +12,9 @@
 // (utility/spawn-glue) and declared weak below. A program that links that
 // archive gets a working posix_spawn; one that doesn't gets ENOSYS, and the
 // link never fails either way. Link the archive in the same --start-group as
-// libc.a.
+// libc.a, *and* pass -Wl,--undefined=etos_spawn_elf: a weak undefined
+// reference never pulls a member out of a static archive, so without it the
+// glue is silently left out and posix_spawn reports ENOSYS.
 //
 // What this file does itself is the POSIX side: find the executable (PATH
 // search for posix_spawnp), read it, translate the file actions into slot
